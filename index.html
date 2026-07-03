@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GRIDFISH · Pionex Grid Advisor — LINK / SOL / ETH</title>
+<style>
+  :root{
+    --paper:#F6F5F0; --panel:#FFFFFF; --ink:#17181A; --muted:#8B887E;
+    --line:#DBD8CF; --line-soft:#E9E7E0;
+    --green:#1E7A3C; --green-soft:#DFF0E3; --red:#C5352B; --red-soft:#F7E2DF;
+    --amber:#B77400;
+  }
+  *{box-sizing:border-box; margin:0; padding:0}
+  html,body{background:var(--paper); color:var(--ink);
+    font:13px/1.55 "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-variant-numeric: tabular-nums;}
+  .wrap{max-width:1080px; margin:0 auto; padding:20px 14px 60px}
+
+  .tag{display:inline-block; font-size:10px; letter-spacing:.14em; text-transform:uppercase; color:var(--muted)}
+  .badge{display:inline-block; font-size:10px; letter-spacing:.1em; padding:2px 8px; border:1px solid var(--line); border-radius:3px; background:var(--panel)}
+  .badge.live{color:var(--green); border-color:var(--green); background:var(--green-soft)}
+  .badge.demo{color:var(--amber); border-color:var(--amber); background:#FBF1DC}
+
+  header{display:flex; justify-content:space-between; align-items:center; gap:10px;
+    border:1px solid var(--line); background:var(--panel); border-radius:8px; padding:12px 16px}
+  header .logo{display:flex; align-items:center; gap:10px}
+  header .dot{width:22px;height:22px;border:1.5px solid var(--ink);border-radius:50%;display:grid;place-items:center;font-size:11px}
+  header h1{font-size:12px; letter-spacing:.12em; font-weight:600}
+  header h1 b{color:var(--green)}
+  #clock{color:var(--muted); font-size:11px}
+
+  .grid2{display:grid; grid-template-columns:340px 1fr; gap:12px; margin-top:12px}
+  @media(max-width:860px){ .grid2{grid-template-columns:1fr} }
+
+  .card{border:1px solid var(--line); background:var(--panel); border-radius:8px; overflow:hidden}
+  .card>.hd{display:flex; justify-content:space-between; align-items:center; gap:8px;
+    padding:9px 14px; border-bottom:1px solid var(--line-soft)}
+  .card>.hd .t{font-size:11px; letter-spacing:.12em; text-transform:uppercase; font-weight:600}
+  .card>.bd{padding:14px}
+
+  /* ------ controls ------ */
+  .fld{margin-bottom:12px}
+  .fld label{display:block; font-size:10px; letter-spacing:.12em; text-transform:uppercase; color:var(--muted); margin-bottom:5px}
+  .seg{display:flex; gap:6px; flex-wrap:wrap}
+  .seg button{flex:1; min-width:64px; padding:8px 6px; font:inherit; font-size:12px; cursor:pointer;
+    border:1px solid var(--line); background:var(--paper); border-radius:5px; color:var(--ink)}
+  .seg button.on{background:var(--ink); color:#fff; border-color:var(--ink)}
+  .seg button.on.long{background:var(--green); border-color:var(--green)}
+  .seg button.on.short{background:var(--red); border-color:var(--red)}
+  input[type=number]{width:100%; padding:8px 10px; font:inherit; border:1px solid var(--line); border-radius:5px; background:var(--paper)}
+  .row2{display:grid; grid-template-columns:1fr 1fr; gap:8px}
+  .go{width:100%; padding:12px; font:inherit; font-weight:700; letter-spacing:.08em; text-transform:uppercase; font-size:12px;
+    background:var(--green); color:#fff; border:0; border-radius:6px; cursor:pointer}
+  .go:disabled{opacity:.5; cursor:wait}
+  .note{font-size:11px; color:var(--muted); margin-top:8px}
+
+  /* ------ market strip ------ */
+  .mkt{display:grid; grid-template-columns:repeat(5,1fr); gap:0; border-top:1px solid var(--line-soft)}
+  .mkt div{padding:10px 12px; border-right:1px solid var(--line-soft)}
+  .mkt div:last-child{border-right:0}
+  .mkt .k{font-size:9px; letter-spacing:.12em; text-transform:uppercase; color:var(--muted)}
+  .mkt .v{font-size:13px; font-weight:600; margin-top:2px}
+  .up{color:var(--green)} .dn{color:var(--red)}
+  .bigpx{font-size:34px; font-weight:700; letter-spacing:-.5px; padding:14px 14px 4px}
+  .bigpx small{font-size:12px; color:var(--muted); font-weight:400}
+
+  /* ------ pionex form card (signature) ------ */
+  .pnx .frow{display:flex; justify-content:space-between; align-items:center; gap:10px;
+    padding:9px 14px; border-bottom:1px dashed var(--line-soft)}
+  .pnx .frow:last-child{border-bottom:0}
+  .pnx .fk{font-size:11px; color:var(--muted)}
+  .pnx .fk s{display:block; text-decoration:none; color:var(--ink); font-size:12px}
+  .pnx .fv{display:flex; align-items:center; gap:8px}
+  .pnx .fv b{font-size:14px}
+  .cp{font-size:10px; padding:3px 8px; border:1px solid var(--line); background:var(--paper); border-radius:4px; cursor:pointer; color:var(--muted)}
+  .cp:active{background:var(--ink); color:#fff}
+
+  /* ------ sim ------ */
+  canvas{width:100%; height:auto; display:block}
+  .stats{display:grid; grid-template-columns:repeat(3,1fr); gap:0; border-top:1px solid var(--line-soft)}
+  .stats div{padding:10px 12px; border-right:1px solid var(--line-soft); border-bottom:1px solid var(--line-soft)}
+  .stats div:nth-child(3n){border-right:0}
+  .stats .k{font-size:9px; letter-spacing:.12em; text-transform:uppercase; color:var(--muted)}
+  .stats .v{font-size:15px; font-weight:700; margin-top:2px}
+  .bar{height:8px; background:var(--line-soft); border-radius:4px; overflow:hidden; margin-top:6px}
+  .bar i{display:block; height:100%; background:var(--green)}
+
+  .disc{margin-top:14px; border:1px dashed var(--line); border-radius:8px; padding:12px 14px; font-size:11px; color:var(--muted)}
+  .hide{display:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="logo">
+      <div class="dot">◦</div>
+      <div>
+        <h1>GRIDFISH · <b>PIONEX GRID ADVISOR</b></h1>
+        <span class="tag">LINK · SOL · ETH — SPOT GRID &amp; FUTURES GRID · TARGET +1–2%</span>
+      </div>
+    </div>
+    <div style="text-align:right">
+      <span id="modeBadge" class="badge live">● SIAP</span><br>
+      <span id="clock"></span>
+    </div>
+  </header>
+
+  <div class="grid2">
+    <!-- ================= LEFT : CONTROLS ================= -->
+    <div>
+      <div class="card">
+        <div class="hd"><span class="t">Parameter Strategi</span><span class="tag">INPUT</span></div>
+        <div class="bd">
+          <div class="fld">
+            <label>Koin</label>
+            <div class="seg" id="segCoin">
+              <button data-v="LINK" class="on">LINK</button>
+              <button data-v="SOL">SOL</button>
+              <button data-v="ETH">ETH</button>
+            </div>
+          </div>
+          <div class="fld">
+            <label>Produk</label>
+            <div class="seg" id="segProd">
+              <button data-v="spot" class="on">Grid Spot</button>
+              <button data-v="fut">Futures Grid</button>
+            </div>
+          </div>
+          <div class="fld hide" id="fldDir">
+            <label>Arah (Futures)</label>
+            <div class="seg" id="segDir">
+              <button data-v="long" class="on long">Long</button>
+              <button data-v="short">Short</button>
+              <button data-v="neutral">Neutral</button>
+            </div>
+          </div>
+          <div class="row2">
+            <div class="fld">
+              <label>Investasi (USDT)</label>
+              <input type="number" id="inInvest" value="50" min="10" step="1">
+            </div>
+            <div class="fld hide" id="fldLev">
+              <label>Leverage</label>
+              <input type="number" id="inLev" value="3" min="1" max="10" step="1">
+            </div>
+          </div>
+          <div class="row2">
+            <div class="fld">
+              <label>Horizon (hari)</label>
+              <input type="number" id="inDays" value="7" min="1" max="30" step="1">
+            </div>
+            <div class="fld">
+              <label>Fee per sisi (%)</label>
+              <input type="number" id="inFee" value="0.05" min="0" max="0.2" step="0.01">
+            </div>
+          </div>
+          <button class="go" id="btnGo">Minta Rekomendasi</button>
+          <div class="note">Harga di-fetch ke CoinMarketCap <b>hanya saat tombol ditekan</b> (cache 60 dtk) — tidak ada polling terus-menerus.</div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:12px" id="cardMkt">
+        <div class="hd"><span class="t">Data Pasar</span><span class="tag" id="mktSrc">COINMARKETCAP · ON-DEMAND</span></div>
+        <div class="bigpx" id="mktPrice">—</div>
+        <div class="mkt">
+          <div><div class="k">1H</div><div class="v" id="ch1">—</div></div>
+          <div><div class="k">24H</div><div class="v" id="ch24">—</div></div>
+          <div><div class="k">7D</div><div class="v" id="ch7">—</div></div>
+          <div><div class="k">30D</div><div class="v" id="ch30">—</div></div>
+          <div><div class="k">VOL σ/HARI</div><div class="v" id="volD">—</div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ================= RIGHT : OUTPUT ================= -->
+    <div>
+      <div class="card pnx" id="cardReco">
+        <div class="hd">
+          <span class="t" id="recoTitle">Rekomendasi — isi ke form Pionex</span>
+          <span class="badge" id="recoBadge">MENUNGGU</span>
+        </div>
+        <div id="recoBody">
+          <div class="bd" style="color:var(--muted)">Pilih koin &amp; produk, lalu tekan <b>Minta Rekomendasi</b>.<br>
+          Output di panel ini dibuat 1:1 dengan urutan field pada form <i>Grid Trading</i> / <i>Futures Grid</i> Pionex — tinggal salin.</div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:12px">
+        <div class="hd">
+          <span class="t">Probability Lattice — 5.000 Simulasi</span>
+          <span class="tag" id="simMeta">MONTE CARLO · GBM</span>
+        </div>
+        <div class="bd" style="padding-bottom:6px">
+          <canvas id="cvPaths" width="960" height="240"></canvas>
+        </div>
+        <div class="bd" style="padding-top:0">
+          <canvas id="cvHist" width="960" height="180"></canvas>
+        </div>
+        <div class="stats" id="simStats"></div>
+      </div>
+
+      <div class="disc">
+        ⚠ <b>Bukan nasihat keuangan.</b> Simulasi Monte Carlo adalah model probabilistik dari volatilitas historis — bukan prediksi. Target 1–2% tidak dijamin; futures dengan leverage dapat terlikuidasi dan kehilangan seluruh margin. Gunakan dana yang siap Anda hilangkan, dan verifikasi setiap angka sebelum menekan "Create" di Pionex.
+      </div>
+    </div>
+  </div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
