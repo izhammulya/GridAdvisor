@@ -65,6 +65,15 @@
   .bigpx{font-size:34px; font-weight:700; letter-spacing:-.5px; padding:14px 14px 4px}
   .bigpx small{font-size:12px; color:var(--muted); font-weight:400}
 
+  /* ------ trend card ------ */
+  .trend3{display:grid; grid-template-columns:repeat(3,1fr); gap:0; border-top:1px solid var(--line-soft)}
+  .trend3 div{padding:10px 12px; border-right:1px solid var(--line-soft)}
+  .trend3 div:last-child{border-right:0}
+  .trend3 .k{font-size:9px; letter-spacing:.12em; text-transform:uppercase; color:var(--muted)}
+  .trend3 .v{font-size:13px; font-weight:700; margin-top:2px}
+  #trPred{padding:10px 14px; font-size:11px; border-top:1px solid var(--line-soft)}
+  #trNote{padding:8px 14px 12px; font-size:11px; color:var(--muted)}
+
   /* ------ pionex form card (signature) ------ */
   .pnx .frow{display:flex; justify-content:space-between; align-items:center; gap:10px;
     padding:9px 14px; border-bottom:1px dashed var(--line-soft)}
@@ -98,7 +107,7 @@
       <div class="dot">◦</div>
       <div>
         <h1>GRIDFISH · <b>PIONEX GRID ADVISOR</b></h1>
-        <span class="tag">LINK · SOL · ETH — SPOT GRID &amp; FUTURES GRID · TARGET +1–2%</span>
+        <span class="tag">LINK · SOL · ETH — GRID SPOT &amp; FUTURES · TARGET 0.30% (0.15 USDT / 50 USDT)</span>
       </div>
     </div>
     <div style="text-align:right">
@@ -157,7 +166,7 @@
             </div>
           </div>
           <button class="go" id="btnGo">Minta Rekomendasi</button>
-          <div class="note">Harga di-fetch ke CoinMarketCap <b>hanya saat tombol ditekan</b> (cache 60 dtk) — tidak ada polling terus-menerus.</div>
+          <div class="note">Target profit otomatis: <b>0.30% dari investasi</b> (50 USDT → 0.15 USDT; 100 USDT → 0.30 USDT). Grid Spot memakai aturan <b>point ÷ pembagi + 1</b>. Harga di-fetch ke CoinMarketCap <b>hanya saat tombol ditekan</b> (cache 60 dtk).</div>
         </div>
       </div>
 
@@ -172,6 +181,20 @@
           <div><div class="k">VOL σ/HARI</div><div class="v" id="volD">—</div></div>
         </div>
       </div>
+
+      <div class="card" style="margin-top:12px" id="cardTrend">
+        <div class="hd"><span class="t">Analisa Trend Series</span><span class="tag">REGRESI LOG-PRICE · 30D→NOW</span></div>
+        <div class="bd" style="padding-bottom:6px">
+          <canvas id="cvSpark" width="620" height="150"></canvas>
+        </div>
+        <div class="trend3">
+          <div><div class="k">Trend</div><div class="v" id="trLabel">—</div></div>
+          <div><div class="k">Drift / hari</div><div class="v" id="trDrift">—</div></div>
+          <div><div class="k">Kekuatan R²</div><div class="v" id="trR2">—</div></div>
+        </div>
+        <div id="trPred">—</div>
+        <div id="trNote">Tekan "Minta Rekomendasi" untuk melihat trend &amp; prediksi.</div>
+      </div>
     </div>
 
     <!-- ================= RIGHT : OUTPUT ================= -->
@@ -183,14 +206,16 @@
         </div>
         <div id="recoBody">
           <div class="bd" style="color:var(--muted)">Pilih koin &amp; produk, lalu tekan <b>Minta Rekomendasi</b>.<br>
-          Output di panel ini dibuat 1:1 dengan urutan field pada form <i>Grid Trading</i> / <i>Futures Grid</i> Pionex — tinggal salin.</div>
+          Grid Spot dihitung dengan aturan custom: <b>jumlah grid = (range dalam point ÷ pembagi) + 1</b>
+          — LINK &lt;10: pembagi 2, harga 10–20: pembagi 3, 20–30: pembagi 4, dst. Confidence = persentase
+          dari 5.000 simulasi yang mencapai target 0.30% (0.15 USDT per 50 USDT).</div>
         </div>
       </div>
 
       <div class="card" style="margin-top:12px">
         <div class="hd">
           <span class="t">Probability Lattice — 5.000 Simulasi</span>
-          <span class="tag" id="simMeta">MONTE CARLO · GBM</span>
+          <span class="tag" id="simMeta">MONTE CARLO · GBM + DRIFT TREND</span>
         </div>
         <div class="bd" style="padding-bottom:6px">
           <canvas id="cvPaths" width="960" height="240"></canvas>
@@ -202,7 +227,7 @@
       </div>
 
       <div class="disc">
-        ⚠ <b>Bukan nasihat keuangan.</b> Simulasi Monte Carlo adalah model probabilistik dari volatilitas historis — bukan prediksi. Target 1–2% tidak dijamin; futures dengan leverage dapat terlikuidasi dan kehilangan seluruh margin. Gunakan dana yang siap Anda hilangkan, dan verifikasi setiap angka sebelum menekan "Create" di Pionex.
+        ⚠ <b>Bukan nasihat keuangan.</b> Simulasi Monte Carlo adalah model probabilistik dari volatilitas &amp; trend historis — bukan prediksi. Target 0.30% tidak dijamin; grid spot bisa mengalami floating loss saat downtrend, dan futures dengan leverage dapat terlikuidasi hingga kehilangan seluruh margin. Gunakan dana yang siap Anda hilangkan, dan verifikasi setiap angka sebelum menekan "Create" di Pionex.
       </div>
     </div>
   </div>
