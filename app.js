@@ -1,7 +1,15 @@
 /* GRIDFISH — Pionex Grid Advisor (LINK/SOL/ETH)
    - Harga: /api/quotes (proxy CoinMarketCap, on-demand saja)
-   - Rekomendasi: range, jumlah grid, trigger, TP/SL, est. liq
-   - Validasi: 5.000 simulasi Monte Carlo (GBM) dari volatilitas 1h/24h/7d/30d
+   - Grid Spot mengikuti ATURAN CUSTOM:
+       * Target profit = 0.3% dari investasi (0.15 USDT per 50 USDT)
+       * Jumlah grid  = (range dalam "point" ÷ pembagi) + 1
+         - point LINK (harga < 10)  = 0.01  → range 7.6–8.1 = 50 point → 50/2+1 = 26 grid
+         - pembagi: harga <10 → 2, 10–20 → 3, 20–30 → 4, dst (+1 tiap kelipatan 10)
+         - SOL/ETH: satuan point diskalakan mengikuti orde harga (SOL ≈ 0.1, ETH ≈ 1)
+           supaya aturan yang sama tetap masuk akal
+   - Confidence = % dari 5.000 simulasi Monte Carlo yang PnL-nya ≥ target
+   - Trend series: regresi log-price dari perubahan 1h/24h/7d/30d → drift, klasifikasi
+     trend, dan proyeksi harga (fan chart P5/P50/P95)
    Model aproksimasi — bukan jaminan profit. */
 
 'use strict';
@@ -9,6 +17,7 @@
 // ---------- state ----------
 const S = { coin: 'LINK', prod: 'spot', dir: 'long' };
 const N_SIM = 5000;
+const TARGET_RATE = 0.003; // 0.15 USDT per 50 USDT investasi
 const $ = (id) => document.getElementById(id);
 
 // harga fallback bila API key belum di-set (mode demo)
@@ -66,8 +75,56 @@ function dailyVol(q) {
   return Math.min(0.12, Math.max(0.02, vol)); // clamp 2%–12% per hari
 }
 
+// ---------- ATURAN GRID CUSTOM ----------
+// Satuan "point": LINK (harga < 10) → 0.01 sesuai definisi user.
+// Untuk koin berharga besar, satuan point mengikuti orde harga agar step grid
+// tetap ±0.15–0.3% dari harga (SOL ~145 → point 0.1; ETH ~3400 → point 1).
+function pointScale(P) {
+  const exp = Math.max(0, Math.floor(Math.log10(P)) - 1);
+  const scale = Math.pow(10, exp);           // LINK: 1, SOL: 10, ETH: 100
+  return { scale, point: 0.01 * scale };     // LINK: 0.01, SOL: 0.1, ETH: 1
+}
+// Pembagi: harga (ternormalisasi ke skala LINK) <10 → 2, 10–20 → 3, 20–30 → 4, dst.
+function gridDivisor(P) {
+  const { scale } = pointScale(P);
+  return Math.max(2, Math.floor(P / scale / 10) + 2);
+}
+
+// ---------- ANALISA TREND SERIES ----------
+// Rekonstruksi 5 titik harga (H-30, H-7, H-1, H-1jam, sekarang) dari % change,
+// lalu regresi OLS pada ln(harga) → drift per hari + kekuatan trend (R²).
+function buildTrend(q, vol) {
+  const P = q.price;
+  const pts = [
+    { t: -30,     lab: '-30D', p: P / (1 + (q.change_30d || 0) / 100) },
+    { t: -7,      lab: '-7D',  p: P / (1 + (q.change_7d  || 0) / 100) },
+    { t: -1,      lab: '-24H', p: P / (1 + (q.change_24h || 0) / 100) },
+    { t: -1 / 24, lab: '-1H',  p: P / (1 + (q.change_1h  || 0) / 100) },
+    { t: 0,       lab: 'NOW',  p: P },
+  ];
+  const n = pts.length;
+  const xs = pts.map((o) => o.t), ys = pts.map((o) => Math.log(o.p));
+  const mx = xs.reduce((a, b) => a + b, 0) / n, my = ys.reduce((a, b) => a + b, 0) / n;
+  let sxy = 0, sxx = 0, syy = 0;
+  for (let i = 0; i < n; i++) {
+    sxy += (xs[i] - mx) * (ys[i] - my);
+    sxx += (xs[i] - mx) ** 2;
+    syy += (ys[i] - my) ** 2;
+  }
+  const slope = sxy / sxx;                                   // drift ln-price per hari
+  const r2 = syy > 0 ? (sxy * sxy) / (sxx * syy) : 0;        // kekuatan trend 0..1
+
+  // drift untuk simulasi: diberi bobot R² dan diredam 50%, dibatasi ±0.5σ
+  const muSim = Math.max(-0.5 * vol, Math.min(0.5 * vol, slope * 0.5 * r2));
+
+  let label = 'SIDEWAYS', cls = '';
+  if (slope > 0.3 * vol && r2 > 0.3) { label = 'UPTREND'; cls = 'up'; }
+  else if (slope < -0.3 * vol && r2 > 0.3) { label = 'DOWNTREND'; cls = 'dn'; }
+  return { pts, slope, r2, muSim, label, cls };
+}
+
 // ---------- mesin rekomendasi ----------
-function buildReco(q) {
+function buildReco(q, T) {
   const P = q.price;
   const days = Math.max(1, +$('inDays').value || 7);
   const fee = Math.max(0, +$('inFee').value || 0.05) / 100;
@@ -80,20 +137,47 @@ function buildReco(q) {
   const horizonVol = vol * Math.sqrt(days);
   const z = 1.28; // ~80% containment
 
+  // pusat range digeser sedikit mengikuti trend (drift teredam)
+  const centerShift = Math.exp(T.muSim * days * 0.5);
+
   // range menurut arah
   let lowM = z, highM = z;
   if (dir === 'long') { lowM = 1.25 * z; highM = 0.85 * z; }
   if (dir === 'short') { lowM = 0.85 * z; highM = 1.25 * z; }
-  const low = P * (1 - lowM * horizonVol);
-  const high = P * (1 + highM * horizonVol);
+  let low = P * centerShift * (1 - lowM * horizonVol);
+  let high = P * centerShift * (1 + highM * horizonVol);
 
-  // jumlah grid: target profit bersih per grid ~0.35%
-  const netPerGrid = 0.0035;
-  const grossStepPct = netPerGrid + 2 * fee;
-  let grids = Math.round((high - low) / (P * grossStepPct));
-  grids = Math.min(200, Math.max(6, grids));
+  // ---- jumlah grid ----
+  const { point } = pointScale(P);
+  const divisor = gridDivisor(P);
+  let grids, points = null, feeAdjusted = false;
+
+  // bulatkan range ke kelipatan point supaya hitungan point bulat & rapi
+  low = Math.round(low / point) * point;
+  high = Math.round(high / point) * point;
+
+  if (!fut) {
+    // ATURAN CUSTOM (Grid Spot): grid = point/pembagi + 1
+    points = Math.round((high - low) / point);
+    grids = Math.round(points / divisor) + 1;
+    // pengaman fee: pastikan profit per grid tetap positif setelah 2× fee (+buffer 0.05%)
+    const minStepPct = 2 * fee + 0.0005;
+    const maxGrids = Math.max(2, Math.floor((high - low) / (P * minStepPct)));
+    if (grids > maxGrids) { grids = maxGrids; feeAdjusted = true; }
+    grids = Math.min(200, Math.max(2, grids));
+  } else {
+    // Futures: tetap pakai target profit bersih per grid ~0.35%
+    const netPerGrid = 0.0035;
+    const grossStepPct = netPerGrid + 2 * fee;
+    grids = Math.round((high - low) / (P * grossStepPct));
+    grids = Math.min(200, Math.max(6, grids));
+  }
+
   const step = (high - low) / grids;
   const profitPerGridNet = step / P - 2 * fee; // % dari modal per-grid
+
+  // target profit: 0.3% dari investasi (0.15 USDT per 50 USDT)
+  const targetUsd = invest * TARGET_RATE;
 
   // trigger, TP, SL, liq
   const trigger = dir === 'long' ? P * 0.998 : dir === 'short' ? P * 1.002 : null;
@@ -104,7 +188,11 @@ function buildReco(q) {
     : dir === 'long' ? P * (1 - (1 - mmr) / lev)
     : P * (1 + (1 - mmr) / lev);
 
-  return { P, days, fee, invest, fut, dir, lev, vol, low, high, grids, step, profitPerGridNet, trigger, sl, tp, liq };
+  return {
+    P, days, fee, invest, fut, dir, lev, vol, low, high, grids, step,
+    profitPerGridNet, trigger, sl, tp, liq,
+    point, divisor, points, feeAdjusted, targetUsd, mu: T.muSim,
+  };
 }
 
 // ---------- Monte Carlo 5.000 path ----------
@@ -120,8 +208,7 @@ function gauss() {
 function simulate(R) {
   const stepsPerDay = 24, n = Math.round(R.days * stepsPerDay), dt = 1 / stepsPerDay;
   const sigH = R.vol * Math.sqrt(dt);
-  // drift momentum kecil (dibatasi) dari arah pasar 7 hari
-  const mu = 0;
+  const mu = R.mu * dt; // drift per-step dari analisa trend (teredam)
 
   const notional = R.invest * R.lev;
   const perGridCap = notional / R.grids;
@@ -145,7 +232,7 @@ function simulate(R) {
     const keepPath = i < 60 ? [p] : null;
 
     for (let t = 0; t < n; t++) {
-      p = p * Math.exp((mu - 0.5 * sigH * sigH) * 1 + sigH * gauss());
+      p = p * Math.exp((mu - 0.5 * sigH * sigH) + sigH * gauss());
       if (keepPath) keepPath.push(p);
 
       // liq / SL menghentikan path
@@ -153,7 +240,6 @@ function simulate(R) {
         realized = -R.invest; dead = true; deadPx = p; liqCount++; break;
       }
       if ((R.dir !== 'short' && p <= R.sl) || (R.dir === 'short' && p >= R.sl)) {
-        // stop loss: rugi floating pada SL + realized sejauh ini
         dead = true; deadPx = p; slCount++; break;
       }
 
@@ -174,11 +260,10 @@ function simulate(R) {
     let float_ = 0;
     const pEnd = dead ? deadPx : p;
     if (realized !== -R.invest) {
-      const heldCap = Math.min(inv, R.grids) * perGridCap;
       if (R.dir !== 'short') {
         const avgEntry = (Math.min(pEnd, R.P) + R.low) / 2 + R.step * 0.5;
-        const deltaInv = Math.max(0, inv - inv0) * perGridCap; // posisi yg dibuka saat harga turun
-        const baseInv = Math.min(inv, inv0) * perGridCap;      // posisi awal
+        const deltaInv = Math.max(0, inv - inv0) * perGridCap;
+        const baseInv = Math.min(inv, inv0) * perGridCap;
         float_ = baseInv * (pEnd - R.P) / R.P + deltaInv * (pEnd - avgEntry) / avgEntry;
         if (R.dir === 'neutral') float_ *= 0.5;
       } else {
@@ -187,7 +272,6 @@ function simulate(R) {
         const baseInv = Math.min(inv, inv0) * perGridCap;
         float_ = baseInv * (R.P - pEnd) / R.P + deltaInv * (avgEntry - pEnd) / avgEntry;
       }
-      // batasi kerugian futures pada margin
       float_ = Math.max(float_, -R.invest - realized);
     }
 
@@ -197,15 +281,19 @@ function simulate(R) {
   }
 
   const pct = Array.from(pnl, (x) => (x / R.invest) * 100).sort((a, b) => a - b);
-  const q = (p) => pct[Math.min(pct.length - 1, Math.floor(p * pct.length))];
+  const px = Array.from(endPx).sort((a, b) => a - b);
+  const q = (arr, p) => arr[Math.min(arr.length - 1, Math.floor(p * arr.length))];
   const prob = (f) => pct.filter(f).length / pct.length;
+  const targetPct = TARGET_RATE * 100;
+  const mean = pct.reduce((a, b) => a + b, 0) / pct.length;
 
   return {
-    pct, samplePaths,
-    median: q(0.5), p5: q(0.05), p95: q(0.95),
+    pct, samplePaths, mean, targetPct,
+    median: q(pct, 0.5), p5: q(pct, 0.05), p95: q(pct, 0.95),
+    pxP5: q(px, 0.05), pxP50: q(px, 0.5), pxP95: q(px, 0.95),
     pWin: prob((x) => x > 0),
+    pTarget: prob((x) => x >= targetPct),   // ← CONFIDENCE
     p1: prob((x) => x >= 1),
-    p2: prob((x) => x >= 2),
     pLiq: liqCount / N_SIM, pSL: slCount / N_SIM,
   };
 }
@@ -227,6 +315,27 @@ function renderMarket(q, vol) {
   b.textContent = q.demo ? '● DEMO' : '● LIVE';
 }
 
+function renderTrend(T, R, sim) {
+  const lb = $('trLabel');
+  lb.textContent = T.label;
+  lb.className = 'v ' + T.cls;
+  $('trDrift').textContent = pctTxt(T.slope * 100) + '/hari';
+  $('trDrift').className = 'v ' + pctCls(T.slope);
+  $('trR2').textContent = (T.r2 * 100).toFixed(0) + '%';
+
+  $('trPred').innerHTML =
+    `Prediksi H+${R.days} (dari ${N_SIM.toLocaleString()} simulasi): ` +
+    `<b>P50 $${fmt(sim.pxP50)}</b> · band 90% $${fmt(sim.pxP5)} – $${fmt(sim.pxP95)}`;
+
+  let note = '';
+  if (T.label === 'SIDEWAYS') note = '✓ Kondisi ideal untuk grid — harga bolak-balik di dalam range menghasilkan siklus profit.';
+  else if (T.label === 'UPTREND') note = 'Trend naik: grid spot tetap oke, sebagian profit datang dari apresiasi harga. Range sudah digeser sedikit ke atas mengikuti drift.';
+  else note = '⚠ Trend turun: grid spot rawan floating loss (beli terus saat harga turun). Pertimbangkan tunggu sideways, kecilkan investasi, atau disiplinkan stop loss.';
+  $('trNote').textContent = note;
+
+  drawSpark(T);
+}
+
 function frow(label, sub, value, copyVal) {
   const cp = copyVal == null ? '' :
     `<button class="cp" data-cp="${copyVal}">salin</button>`;
@@ -237,7 +346,9 @@ function frow(label, sub, value, copyVal) {
 function renderReco(R, sim) {
   const dirLabel = R.fut ? { long: 'Long', short: 'Short', neutral: 'Neutral' }[R.dir] : 'Spot (Neutral)';
   $('recoTitle').textContent = `Rekomendasi ${S.coin}/USDT — ${R.fut ? 'Futures Grid' : 'Grid Trading'} · ${dirLabel}`;
-  const conf = sim.p1 * 100;
+
+  // CONFIDENCE = % simulasi yang mencapai target (≥ 0.3% dari investasi)
+  const conf = sim.pTarget * 100;
   $('recoBadge').textContent = 'CONFIDENCE ' + conf.toFixed(0) + '%';
   $('recoBadge').className = 'badge ' + (conf >= 55 ? 'live' : 'demo');
 
@@ -245,14 +356,24 @@ function renderReco(R, sim) {
   if (R.fut) h += frow('Arah', 'pilih tab di Pionex', dirLabel);
   h += frow('1. Price Range', 'Lowest price USDT', fmt(R.low), fmt(R.low));
   h += frow('', 'Highest Price USDT', fmt(R.high), fmt(R.high));
-  h += frow('2. Quantity of Grids', 'Profit/grid net ≈ ' + (R.profitPerGridNet * 100).toFixed(2) + '%', R.grids, R.grids);
+  if (!R.fut && R.points != null) {
+    h += frow('2. Quantity of Grids',
+      `${R.points} point ÷ ${R.divisor} + 1${R.feeAdjusted ? ' · dikurangi agar profit/grid > fee' : ''}`,
+      R.grids, R.grids);
+  } else {
+    h += frow('2. Quantity of Grids', 'Profit/grid net ≈ ' + (R.profitPerGridNet * 100).toFixed(2) + '%', R.grids, R.grids);
+  }
+  h += frow('Profit / grid (net)', 'setelah fee 2 sisi', (R.profitPerGridNet * 100).toFixed(3) + '%');
   h += frow('3. Investment', R.fut ? 'margin USDT' : 'total USDT', fmt(R.invest, 2), fmt(R.invest, 2));
+  h += frow('Target profit', (TARGET_RATE * 100).toFixed(2) + '% dari investasi', fmt(R.targetUsd, 2) + ' USDT');
   if (R.fut) h += frow('Leverage', 'dropdown ' + R.lev + 'x', R.lev + 'x');
   h += frow('Trigger price', 'opsional', R.trigger ? fmt(R.trigger) : '— (kosongkan)', R.trigger ? fmt(R.trigger) : null);
   h += frow('Take Profit', 'stop by price', fmt(R.tp), fmt(R.tp));
   h += frow('Stop Loss', 'stop by price', fmt(R.sl), fmt(R.sl));
   h += frow('Grid mode', 'pilih', 'Arithmetic');
   if (R.liq) h += frow('Est. liq price', 'pembanding — jaga SL sebelum liq', fmt(R.liq));
+  h += frow('Confidence', `${N_SIM.toLocaleString()} sim · % path dgn PnL ≥ ${fmt(R.targetUsd, 2)} USDT`,
+    conf.toFixed(1) + '%');
   $('recoBody').innerHTML = h;
 
   $('recoBody').querySelectorAll('.cp').forEach((b) =>
@@ -263,23 +384,52 @@ function renderReco(R, sim) {
 }
 
 function renderStats(R, sim) {
+  const tUsd = fmt(R.targetUsd, 2);
   const cell = (k, v, cls = '', barPct = null) =>
     `<div><div class="k">${k}</div><div class="v ${cls}">${v}</div>${
       barPct == null ? '' : `<div class="bar"><i style="width:${Math.min(100, barPct)}%"></i></div>`}</div>`;
   $('simStats').innerHTML =
-    cell('P(profit ≥ +1%)', (sim.p1 * 100).toFixed(1) + '%', sim.p1 >= 0.5 ? 'up' : '', sim.p1 * 100) +
-    cell('P(profit ≥ +2%)', (sim.p2 * 100).toFixed(1) + '%', '', sim.p2 * 100) +
+    cell(`P(≥ target ${tUsd} USDT)`, (sim.pTarget * 100).toFixed(1) + '%', sim.pTarget >= 0.55 ? 'up' : '', sim.pTarget * 100) +
     cell('P(PnL > 0)', (sim.pWin * 100).toFixed(1) + '%', sim.pWin >= 0.5 ? 'up' : 'dn', sim.pWin * 100) +
-    cell('Median PnL', pctTxt(sim.median), pctCls(sim.median)) +
-    cell('P5 / P95', pctTxt(sim.p5) + ' / ' + pctTxt(sim.p95)) +
+    cell('P(profit ≥ +1%)', (sim.p1 * 100).toFixed(1) + '%', '', sim.p1 * 100) +
+    cell('Median PnL', pctTxt(sim.median) + ' (' + fmt(sim.median * R.invest / 100, 2) + ' USDT)', pctCls(sim.median)) +
+    cell('Rata-rata / P5 / P95', pctTxt(sim.mean) + ' · ' + pctTxt(sim.p5) + ' / ' + pctTxt(sim.p95)) +
     cell(R.liq ? 'P(likuidasi) / P(SL)' : 'P(stop loss)',
          (R.liq ? (sim.pLiq * 100).toFixed(1) + '% / ' : '') + (sim.pSL * 100).toFixed(1) + '%',
          (sim.pLiq + sim.pSL) > 0.2 ? 'dn' : '');
-  $('simMeta').textContent = `MONTE CARLO · ${N_SIM.toLocaleString()} PATH · ${R.days} HARI · σ ${(R.vol * 100).toFixed(2)}%/HARI`;
+  $('simMeta').textContent = `MONTE CARLO · ${N_SIM.toLocaleString()} PATH · ${R.days} HARI · σ ${(R.vol * 100).toFixed(2)}%/HARI · DRIFT ${(R.mu * 100).toFixed(2)}%/HARI`;
 }
 
 // ---------- charts (canvas, tanpa library) ----------
 function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+
+function drawSpark(T) {
+  const cv = $('cvSpark'), ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  const W = cv.width, H = cv.height, padL = 14, padR = 70, padT = 14, padB = 22;
+  const ps = T.pts.map((o) => o.p);
+  const mn = Math.min(...ps), mx = Math.max(...ps), span = (mx - mn) || 1;
+  const X = (i) => padL + (i / (ps.length - 1)) * (W - padL - padR);
+  const Y = (v) => padT + (1 - (v - mn) / span) * (H - padT - padB);
+
+  // garis trend (warna sesuai arah)
+  ctx.strokeStyle = css(T.cls === 'dn' ? '--red' : T.cls === 'up' ? '--green' : '--ink');
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ps.forEach((v, i) => (i ? ctx.lineTo(X(i), Y(v)) : ctx.moveTo(X(0), Y(v))));
+  ctx.stroke();
+
+  // titik data + label waktu
+  ctx.font = '9px ui-monospace';
+  T.pts.forEach((o, i) => {
+    ctx.beginPath(); ctx.arc(X(i), Y(o.p), 3, 0, 7);
+    ctx.fillStyle = css('--ink'); ctx.fill();
+    ctx.fillStyle = css('--muted');
+    ctx.fillText(o.lab, X(i) - 10, H - 6);
+  });
+  ctx.fillStyle = css('--ink');
+  ctx.fillText('$' + fmt(ps[ps.length - 1]), W - padR + 6, Y(ps[ps.length - 1]) + 3);
+}
 
 function drawPaths(R, sim) {
   const cv = $('cvPaths'), ctx = cv.getContext('2d');
@@ -316,8 +466,32 @@ function drawPaths(R, sim) {
     ctx.stroke();
   });
   ctx.globalAlpha = 1;
+
+  // FAN PREDIKSI: median & band 90% analitik GBM (drift trend + σ)
+  const nSteps = Math.round(R.days * 24);
+  const fan = (zq, dash, col, lab) => {
+    ctx.strokeStyle = col; ctx.lineWidth = 1.4; ctx.setLineDash(dash);
+    ctx.beginPath();
+    for (let i = 0; i <= nSteps; i++) {
+      const t = i / 24;
+      const v = R.P * Math.exp((R.mu - 0.5 * R.vol * R.vol) * t + zq * R.vol * Math.sqrt(t));
+      const x = X(i, nSteps + 1), y = Y(v);
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    }
+    ctx.stroke(); ctx.setLineDash([]);
+    if (lab) {
+      const vEnd = R.P * Math.exp((R.mu - 0.5 * R.vol * R.vol) * R.days + zq * R.vol * Math.sqrt(R.days));
+      ctx.fillStyle = col; ctx.font = '9px ui-monospace';
+      ctx.fillText(lab, W - padR - 30, Y(vEnd) - 4);
+    }
+  };
+  const amber = css('--amber');
+  fan(0, [6, 3], amber, 'P50');
+  fan(1.645, [2, 3], amber, 'P95');
+  fan(-1.645, [2, 3], amber, 'P5');
+
   ctx.fillStyle = css('--muted'); ctx.font = '10px ui-monospace';
-  ctx.fillText('60 SAMPLE PATH DARI ' + N_SIM.toLocaleString() + ' — ZONA HIJAU = RANGE GRID', padL, H - 5);
+  ctx.fillText('60 SAMPLE PATH DARI ' + N_SIM.toLocaleString() + ' — HIJAU = RANGE GRID · ORANYE = PROYEKSI TREND P5/P50/P95', padL, H - 5);
 }
 
 function drawHist(sim) {
@@ -332,19 +506,20 @@ function drawHist(sim) {
   for (let i = 0; i < bins; i++) {
     const c = lo + (i + 0.5) * bw;
     const h = (cnt[i] / mx) * (H - padT - padB);
-    ctx.fillStyle = c >= 1 ? css('--green') : c >= 0 ? '#9CC7A6' : css('--red');
+    ctx.fillStyle = c >= sim.targetPct ? css('--green') : c >= 0 ? '#9CC7A6' : css('--red');
     ctx.fillRect(X(i) + 1, H - padB - h, (W - padL - padR) / bins - 2, h);
   }
-  // garis 0% dan +1%
-  [[0, css('--ink'), '0%'], [1, css('--green'), '+1%']].forEach(([v, col, lab]) => {
-    if (v < lo || v > hi) return;
-    const x = padL + ((v - lo) / (hi - lo)) * (W - padL - padR);
-    ctx.strokeStyle = col; ctx.setLineDash([3, 3]);
-    ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, H - padB); ctx.stroke(); ctx.setLineDash([]);
-    ctx.fillStyle = col; ctx.font = '10px ui-monospace'; ctx.fillText(lab, x + 3, padT + 10);
-  });
+  // garis 0% dan garis target
+  [[0, css('--ink'), '0%'], [sim.targetPct, css('--green'), 'TARGET +' + sim.targetPct.toFixed(2) + '%']]
+    .forEach(([v, col, lab]) => {
+      if (v < lo || v > hi) return;
+      const x = padL + ((v - lo) / (hi - lo)) * (W - padL - padR);
+      ctx.strokeStyle = col; ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, H - padB); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = col; ctx.font = '10px ui-monospace'; ctx.fillText(lab, x + 3, padT + 10);
+    });
   ctx.fillStyle = css('--muted'); ctx.font = '10px ui-monospace';
-  ctx.fillText('DISTRIBUSI PnL % TERHADAP MODAL — ' + N_SIM.toLocaleString() + ' SIMULASI', padL, H - 6);
+  ctx.fillText('DISTRIBUSI PnL % TERHADAP MODAL — ' + N_SIM.toLocaleString() + ' SIMULASI · HIJAU TUA = MENCAPAI TARGET', padL, H - 6);
 }
 
 // ---------- main ----------
@@ -355,9 +530,12 @@ $('btnGo').addEventListener('click', async () => {
   btn.textContent = 'MENJALANKAN 5.000 SIMULASI…';
   await new Promise((r) => setTimeout(r, 30)); // biarkan UI update
 
-  const R = buildReco(q);
+  const vol = dailyVol(q);
+  const T = buildTrend(q, vol);
+  const R = buildReco(q, T);
   renderMarket(q, R.vol);
   const sim = simulate(R);
+  renderTrend(T, R, sim);
   renderReco(R, sim);
   renderStats(R, sim);
   drawPaths(R, sim);
