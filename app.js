@@ -1,4 +1,4 @@
-/* GRIDFISH — Pionex Grid Advisor (LINK/SOL/ETH)
+/* GRIDFISH — Pionex Grid Advisor (LINK/SOL/ETH/INJ)
    - Harga: /api/quotes (proxy CoinMarketCap, on-demand saja)
    - Grid Spot mengikuti ATURAN CUSTOM:
        * Target profit = 0.3% dari investasi (0.15 USDT per 50 USDT)
@@ -6,25 +6,45 @@
          - point LINK (harga < 10)  = 0.01  → range 7.6–8.1 = 50 point → 50/2+1 = 26 grid
          - pembagi: harga <10 → 2, 10–20 → 3, 20–30 → 4, dst (+1 tiap kelipatan 10)
          - SOL/ETH: satuan point diskalakan mengikuti orde harga (SOL ≈ 0.1, ETH ≈ 1)
-           supaya aturan yang sama tetap masuk akal
+           INJ (harga belasan USD) memakai point 0.01 seperti LINK — semua otomatis
+           lewat pointScale().
    - Confidence = % dari 5.000 simulasi Monte Carlo yang PnL-nya ≥ target
-   - Trend series: regresi log-price dari perubahan 1h/24h/7d/30d → drift, klasifikasi
-     trend, dan proyeksi harga (fan chart P5/P50/P95)
+     (± margin error binomial ditampilkan supaya jujur soal noise simulasi)
+
+   ===== MESIN SIMULASI v2 =====
+   1. HMM 3-REGIME (default): Bull / Sideways / Bear.
+      - Emisi Gaussian per regime (drift & vol berbeda), transisi Markov persisten.
+      - Filter forward dijalankan pada 4 log-return CMC (30d→7d, 7d→24h, 24h→1h,
+        1h→now) → probabilitas regime SAAT INI (bukan tebakan, tapi inferensi Bayes).
+      - Tiap path Monte Carlo menyampel regime awal dari posterior itu, lalu
+        regime boleh berpindah tiap jam mengikuti matriks transisi → volatilitas
+        clustering & perubahan trend tersimulasi, bukan GBM lurus.
+   2. GBM klasik tetap tersedia (toggle) sebagai pembanding.
+   3. Fat tails: 4% shock diambil dari distribusi 2.5σ (proksi jump/berita).
+   4. Antithetic variates: path berpasangan (+g / −g) → error Monte Carlo turun
+      tanpa menambah jumlah simulasi.
+   5. Grid engine pakai STACK ENTRY PRICE per posisi → floating PnL dihitung dari
+      entry sebenarnya, bukan aproksimasi "tengah zona". Spot dimodelkan seperti
+      Pionex asli: beli inventori awal di harga pasar untuk order jual di atas.
+   6. Fan chart P5/P50/P95 sekarang EMPIRIS dari 5.000 path (checkpoint per ~6 jam),
+      jadi konsisten dengan model apa pun yang dipilih.
+
    Model aproksimasi — bukan jaminan profit. */
 
 'use strict';
 
 // ---------- state ----------
-const S = { coin: 'LINK', prod: 'spot', dir: 'long' };
+const S = { coin: 'LINK', prod: 'spot', dir: 'long', model: 'hmm' };
 const N_SIM = 5000;
 const TARGET_RATE = 0.003; // 0.15 USDT per 50 USDT investasi
 const $ = (id) => document.getElementById(id);
 
 // harga fallback bila API key belum di-set (mode demo)
 const DEMO = {
-  LINK: { price: 7.83, change_1h: -0.3, change_24h: -2.1, change_7d: -5.4, change_30d: 4.2 },
-  SOL:  { price: 145.2, change_1h: 0.2, change_24h: 1.8, change_7d: -3.9, change_30d: 9.5 },
-  ETH:  { price: 3412.5, change_1h: 0.1, change_24h: 0.9, change_7d: 2.7, change_30d: 6.1 },
+  LINK: { price: 7.83,   change_1h: -0.3, change_24h: -2.1, change_7d: -5.4, change_30d: 4.2 },
+  SOL:  { price: 145.2,  change_1h: 0.2,  change_24h: 1.8,  change_7d: -3.9, change_30d: 9.5 },
+  ETH:  { price: 3412.5, change_1h: 0.1,  change_24h: 0.9,  change_7d: 2.7,  change_30d: 6.1 },
+  INJ:  { price: 13.42,  change_1h: 0.4,  change_24h: -1.2, change_7d: 3.8,  change_30d: -6.5 },
 };
 
 // ---------- segmented controls ----------
@@ -46,6 +66,7 @@ seg('segProd', 'prod', () => {
   $('fldLev').classList.toggle('hide', !fut);
 });
 seg('segDir', 'dir');
+seg('segModel', 'model');
 
 // jam header
 setInterval(() => { $('clock').textContent = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC'; }, 1000);
@@ -77,12 +98,12 @@ function dailyVol(q) {
 
 // ---------- ATURAN GRID CUSTOM ----------
 // Satuan "point": LINK (harga < 10) → 0.01 sesuai definisi user.
-// Untuk koin berharga besar, satuan point mengikuti orde harga agar step grid
-// tetap ±0.15–0.3% dari harga (SOL ~145 → point 0.1; ETH ~3400 → point 1).
+// Koin berharga besar diskalakan mengikuti orde harga agar step grid tetap
+// ±0.15–0.3% dari harga (SOL ~145 → 0.1; ETH ~3400 → 1; INJ ~13 → 0.01).
 function pointScale(P) {
   const exp = Math.max(0, Math.floor(Math.log10(P)) - 1);
-  const scale = Math.pow(10, exp);           // LINK: 1, SOL: 10, ETH: 100
-  return { scale, point: 0.01 * scale };     // LINK: 0.01, SOL: 0.1, ETH: 1
+  const scale = Math.pow(10, exp);           // LINK/INJ: 1, SOL: 10, ETH: 100
+  return { scale, point: 0.01 * scale };     // LINK/INJ: 0.01, SOL: 0.1, ETH: 1
 }
 // Pembagi: harga (ternormalisasi ke skala LINK) <10 → 2, 10–20 → 3, 20–30 → 4, dst.
 function gridDivisor(P) {
@@ -90,9 +111,7 @@ function gridDivisor(P) {
   return Math.max(2, Math.floor(P / scale / 10) + 2);
 }
 
-// ---------- ANALISA TREND SERIES ----------
-// Rekonstruksi 5 titik harga (H-30, H-7, H-1, H-1jam, sekarang) dari % change,
-// lalu regresi OLS pada ln(harga) → drift per hari + kekuatan trend (R²).
+// ---------- ANALISA TREND SERIES (regresi — tetap dipakai utk label & sparkline) ----------
 function buildTrend(q, vol) {
   const P = q.price;
   const pts = [
@@ -114,7 +133,7 @@ function buildTrend(q, vol) {
   const slope = sxy / sxx;                                   // drift ln-price per hari
   const r2 = syy > 0 ? (sxy * sxy) / (sxx * syy) : 0;        // kekuatan trend 0..1
 
-  // drift untuk simulasi: diberi bobot R² dan diredam 50%, dibatasi ±0.5σ
+  // drift GBM klasik: bobot R², diredam 50%, dibatasi ±0.5σ
   const muSim = Math.max(-0.5 * vol, Math.min(0.5 * vol, slope * 0.5 * r2));
 
   let label = 'SIDEWAYS', cls = '';
@@ -123,8 +142,82 @@ function buildTrend(q, vol) {
   return { pts, slope, r2, muSim, label, cls };
 }
 
+// ---------- HMM 3-REGIME ----------
+// State 0 = BULL, 1 = SIDEWAYS, 2 = BEAR.
+// Parameter drift/vol diskalakan dari σ harian koin — jadi otomatis beradaptasi
+// per koin tanpa perlu data historis panjang.
+function buildHMM(q, vol) {
+  const mu = [ +0.9 * vol, 0, -0.9 * vol ];       // drift/hari per regime
+  const sg = [ 1.0 * vol, 0.75 * vol, 1.30 * vol ]; // σ/hari per regime (bear paling liar)
+  // matriks transisi PER HARI (persisten: regime crypto bertahan berhari-hari)
+  const A = [
+    [0.88, 0.10, 0.02],
+    [0.08, 0.84, 0.08],
+    [0.02, 0.10, 0.88],
+  ];
+
+  // ---- observasi: 4 log-return antar snapshot CMC, dgn panjang interval berbeda
+  const P = q.price;
+  const p30 = P / (1 + (q.change_30d || 0) / 100);
+  const p7  = P / (1 + (q.change_7d  || 0) / 100);
+  const p1  = P / (1 + (q.change_24h || 0) / 100);
+  const ph  = P / (1 + (q.change_1h  || 0) / 100);
+  const obs = [
+    { r: Math.log(p7 / p30), L: 23 },        // 30d → 7d
+    { r: Math.log(p1 / p7),  L: 6 },         // 7d  → 24h
+    { r: Math.log(ph / p1),  L: 23 / 24 },   // 24h → 1h
+    { r: Math.log(P / ph),   L: 1 / 24 },    // 1h  → now
+  ];
+
+  // ---- alat matriks kecil
+  const matMul = (X, Y) => X.map((row) =>
+    Y[0].map((_, j) => row.reduce((s, v, k) => s + v * Y[k][j], 0)));
+  const I3 = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  // A^L: bagian bulat dgn perkalian berulang, sisa pecahan dgn interpolasi linier
+  function matPow(L) {
+    let M = I3;
+    const w = Math.floor(L);
+    for (let i = 0; i < w; i++) M = matMul(M, A);
+    const f = L - w;
+    if (f > 1e-9) {
+      const Af = A.map((row, i) => row.map((v, j) => (i === j ? 1 + f * (v - 1) : f * v)));
+      M = matMul(M, Af);
+    }
+    return M;
+  }
+
+  // emisi: return interval L hari di regime k ~ N(mu_k·L, sg_k²·L)
+  const emis = (r, L, k) => {
+    const v = sg[k] * sg[k] * L;
+    return Math.exp(-((r - mu[k] * L) ** 2) / (2 * v)) / Math.sqrt(2 * Math.PI * v);
+  };
+
+  // ---- forward filter → posterior regime saat ini
+  let alpha = [1 / 3, 1 / 3, 1 / 3];
+  for (const o of obs) {
+    const T = matPow(o.L);
+    const pred = [0, 1, 2].map((j) => alpha[0] * T[0][j] + alpha[1] * T[1][j] + alpha[2] * T[2][j]);
+    let upd = pred.map((p, k) => p * emis(o.r, o.L, k));
+    const Z = upd[0] + upd[1] + upd[2];
+    alpha = Z > 0 ? upd.map((x) => x / Z) : [1 / 3, 1 / 3, 1 / 3];
+  }
+
+  // matriks transisi per-JAM utk simulasi (aproksimasi generator)
+  const dt = 1 / 24;
+  const Ah = A.map((row, i) => row.map((v, j) => (i === j ? 1 + dt * (v - 1) : dt * v)));
+  // kumulatif utk sampling cepat
+  const AhCum = Ah.map((row) => [row[0], row[0] + row[1], 1]);
+  const piCum = [alpha[0], alpha[0] + alpha[1], 1];
+
+  // drift efektif (utk geser range & label): E[mu] posterior, diredam 60%
+  const muExp0 = alpha[0] * mu[0] + alpha[1] * mu[1] + alpha[2] * mu[2];
+  const muEff = Math.max(-0.5 * vol, Math.min(0.5 * vol, muExp0 * 0.6));
+
+  return { mu, sg, A, Ah, AhCum, alpha, piCum, muEff };
+}
+
 // ---------- mesin rekomendasi ----------
-function buildReco(q, T) {
+function buildReco(q, T, H) {
   const P = q.price;
   const days = Math.max(1, +$('inDays').value || 7);
   const fee = Math.max(0, +$('inFee').value || 0.05) / 100;
@@ -132,13 +225,15 @@ function buildReco(q, T) {
   const fut = S.prod === 'fut';
   const dir = fut ? S.dir : 'neutral';
   const lev = fut ? Math.min(10, Math.max(1, Math.round(+$('inLev').value || 3))) : 1;
+  const useHMM = S.model === 'hmm';
 
   const vol = dailyVol(q);
   const horizonVol = vol * Math.sqrt(days);
   const z = 1.28; // ~80% containment
 
-  // pusat range digeser sedikit mengikuti trend (drift teredam)
-  const centerShift = Math.exp(T.muSim * days * 0.5);
+  // drift utk penggeseran range & fan: HMM → E[mu] posterior; GBM → regresi trend
+  const mu = useHMM ? H.muEff : T.muSim;
+  const centerShift = Math.exp(mu * days * 0.5);
 
   // range menurut arah
   let lowM = z, highM = z;
@@ -191,11 +286,11 @@ function buildReco(q, T) {
   return {
     P, days, fee, invest, fut, dir, lev, vol, low, high, grids, step,
     profitPerGridNet, trigger, sl, tp, liq,
-    point, divisor, points, feeAdjusted, targetUsd, mu: T.muSim,
+    point, divisor, points, feeAdjusted, targetUsd, mu, useHMM,
   };
 }
 
-// ---------- Monte Carlo 5.000 path ----------
+// ---------- RNG ----------
 let gaussSpare = null;
 function gauss() {
   if (gaussSpare !== null) { const v = gaussSpare; gaussSpare = null; return v; }
@@ -205,77 +300,163 @@ function gauss() {
   gaussSpare = v * m; return u * m;
 }
 
-function simulate(R) {
+// ---------- Monte Carlo 5.000 path (HMM regime-switching / GBM) ----------
+function simulate(R, H) {
   const stepsPerDay = 24, n = Math.round(R.days * stepsPerDay), dt = 1 / stepsPerDay;
-  const sigH = R.vol * Math.sqrt(dt);
-  const mu = R.mu * dt; // drift per-step dari analisa trend (teredam)
+  const useHMM = R.useHMM;
 
   const notional = R.invest * R.lev;
   const perGridCap = notional / R.grids;
-  const stepPct = R.step / R.P;
-  const netGrid = perGridCap * (stepPct - 2 * R.fee); // profit $ per siklus grid
 
   const pnl = new Float64Array(N_SIM);
   const endPx = new Float64Array(N_SIM);
   let liqCount = 0, slCount = 0;
   const samplePaths = [];
 
+  // checkpoint utk fan chart empiris (per ~6 jam)
+  const ckEvery = Math.max(1, Math.round(n / 28));
+  const ckIdx = [];
+  for (let t = ckEvery; t <= n; t += ckEvery) ckIdx.push(t);
+  if (ckIdx[ckIdx.length - 1] !== n) ckIdx.push(n);
+  const ckPx = ckIdx.map(() => new Float64Array(N_SIM));
+  const ckAt = new Int16Array(n + 2).fill(-1);
+  ckIdx.forEach((t, c) => { ckAt[t] = c; });
+
+  // buffer antithetic: path ganjil memakai regime & |shock| path genap dgn tanda dibalik
+  const gBuf = new Float64Array(n);
+  const rgBuf = new Int8Array(n);
+
+  // level harga grid: idx 0..grids → low + idx*step
+  const levelOf = (p) => Math.min(R.grids, Math.max(0, Math.floor((p - R.low) / R.step)));
+
   for (let i = 0; i < N_SIM; i++) {
+    const anti = (i & 1) === 1; // path antithetic (pasangan path genap sebelumnya)
     let p = R.P;
-    let level = Math.floor((p - R.low) / R.step);
-    // inventori awal: long grid langsung buka posisi pada grid di atas harga; neutral setengah
-    let inv = R.dir === 'long' ? Math.max(0, R.grids - level)
-            : R.dir === 'short' ? Math.max(0, level)
-            : Math.round(R.grids / 2);
-    const inv0 = inv;
-    let realized = 0, dead = false, deadPx = 0;
+
+    // ---- regime awal (HMM): sampel dari posterior filter (pasangan reuse jalur regime)
+    let rg = 1;
+    if (useHMM && !anti) {
+      const u = Math.random();
+      rg = u < H.piCum[0] ? 0 : u < H.piCum[1] ? 1 : 2;
+    }
+
+    // ---- inventori sebagai stack harga entry
+    // Spot (Pionex): beli inventori awal di harga pasar utk order jual di atas.
+    // Futures long: idem (posisi long utk sell order di atas).
+    // Futures short: buka short di harga pasar utk buy-back order di bawah.
+    // Futures neutral: mulai kosong — long dibuka saat harga turun, short saat naik.
+    const longs = [], shorts = [];
+    let level = levelOf(p);
+    if (!R.fut || R.dir === 'long') {
+      const above = R.grids - level;
+      for (let k = 0; k < above; k++) longs.push(R.P);
+    } else if (R.dir === 'short') {
+      for (let k = 0; k < level; k++) shorts.push(R.P);
+    }
+    const centerLevel = level; // utk neutral
+
+    let realized = 0, dead = false, wiped = false, deadPx = 0;
     const keepPath = i < 60 ? [p] : null;
 
     for (let t = 0; t < n; t++) {
-      p = p * Math.exp((mu - 0.5 * sigH * sigH) + sigH * gauss());
+      // ---- regime transition per jam (anti reuse jalur regime pasangannya)
+      let sigD = R.vol, muD = R.mu;
+      if (useHMM) {
+        if (!anti) {
+          const u = Math.random();
+          const cum = H.AhCum[rg];
+          rg = u < cum[0] ? 0 : u < cum[1] ? 1 : 2;
+          rgBuf[t] = rg;
+        } else {
+          rg = rgBuf[t];
+        }
+        sigD = H.sg[rg]; muD = H.mu[rg];
+      }
+      const sigH = sigD * Math.sqrt(dt);
+
+      // ---- shock: antithetic (+g / −g) + fat tails (4% shock dari 2.5σ)
+      let g;
+      if (!anti) {
+        g = gauss();
+        if (Math.random() < 0.04) g *= 2.5;
+        gBuf[t] = g;
+      } else {
+        g = -gBuf[t];
+      }
+
+      p = p * Math.exp((muD * dt - 0.5 * sigH * sigH) + sigH * g);
       if (keepPath) keepPath.push(p);
 
       // liq / SL menghentikan path
       if (R.liq && ((R.dir === 'long' && p <= R.liq) || (R.dir === 'short' && p >= R.liq))) {
-        realized = -R.invest; dead = true; deadPx = p; liqCount++; break;
+        realized = -R.invest; dead = true; wiped = true; deadPx = p; liqCount++; break;
       }
       if ((R.dir !== 'short' && p <= R.sl) || (R.dir === 'short' && p >= R.sl)) {
         dead = true; deadPx = p; slCount++; break;
       }
 
-      const nl = Math.min(R.grids, Math.max(0, Math.floor((p - R.low) / R.step)));
-      if (nl > level) { // harga naik melewati grid
-        const up = nl - level;
-        if (R.dir !== 'short') { const fills = Math.min(up, inv); realized += fills * netGrid; inv -= fills; }
-        else { inv += up; }
-      } else if (nl < level) { // harga turun melewati grid
-        const dn = level - nl;
-        if (R.dir === 'short') { const fills = Math.min(dn, inv); realized += fills * netGrid; inv -= fills; }
-        else { inv += dn; }
+      const nl = levelOf(p);
+      if (nl !== level) {
+        if (nl > level) {
+          // harga naik melewati grid: jual long (realisasi) / buka short (neutral & short)
+          for (let L = level + 1; L <= nl; L++) {
+            const sellPx = R.low + L * R.step;
+            if (R.dir === 'neutral' && R.fut) {
+              if (L > centerLevel) { shorts.push(sellPx); }
+              else if (longs.length) {
+                const e = longs.pop();
+                realized += perGridCap * ((sellPx - e) / e - 2 * R.fee);
+              }
+            } else if (R.dir !== 'short') {
+              if (longs.length) {
+                const e = longs.pop();
+                realized += perGridCap * ((sellPx - e) / e - 2 * R.fee);
+              }
+            } else {
+              shorts.push(sellPx);
+            }
+          }
+        } else {
+          // harga turun melewati grid: beli long / tutup short (realisasi)
+          for (let L = level; L > nl; L--) {
+            const buyPx = R.low + (L - 1) * R.step;
+            if (R.dir === 'neutral' && R.fut) {
+              if (L - 1 < centerLevel) { longs.push(buyPx); }
+              else if (shorts.length) {
+                const e = shorts.pop();
+                realized += perGridCap * ((e - buyPx) / e - 2 * R.fee);
+              }
+            } else if (R.dir !== 'short') {
+              longs.push(buyPx);
+            } else {
+              if (shorts.length) {
+                const e = shorts.pop();
+                realized += perGridCap * ((e - buyPx) / e - 2 * R.fee);
+              }
+            }
+          }
+        }
+        level = nl;
       }
-      level = nl;
+
+      // checkpoint fan chart
+      const ci = ckAt[t + 1];
+      if (ci >= 0) ckPx[ci][i] = p;
     }
 
-    // floating PnL dari inventori tersisa (aproksimasi: entry rata-rata = tengah zona held)
-    let float_ = 0;
     const pEnd = dead ? deadPx : p;
-    if (realized !== -R.invest) {
-      if (R.dir !== 'short') {
-        const avgEntry = (Math.min(pEnd, R.P) + R.low) / 2 + R.step * 0.5;
-        const deltaInv = Math.max(0, inv - inv0) * perGridCap;
-        const baseInv = Math.min(inv, inv0) * perGridCap;
-        float_ = baseInv * (pEnd - R.P) / R.P + deltaInv * (pEnd - avgEntry) / avgEntry;
-        if (R.dir === 'neutral') float_ *= 0.5;
-      } else {
-        const avgEntry = (Math.max(pEnd, R.P) + R.high) / 2 - R.step * 0.5;
-        const deltaInv = Math.max(0, inv - inv0) * perGridCap;
-        const baseInv = Math.min(inv, inv0) * perGridCap;
-        float_ = baseInv * (R.P - pEnd) / R.P + deltaInv * (avgEntry - pEnd) / avgEntry;
-      }
+    // isi checkpoint kosong (path berhenti krn SL/liq) dgn harga akhirnya
+    for (let c = 0; c < ckIdx.length; c++) if (ckPx[c][i] === 0) ckPx[c][i] = pEnd;
+
+    // ---- floating PnL dari stack entry sebenarnya
+    let float_ = 0;
+    if (!wiped) {
+      for (const e of longs) float_ += perGridCap * (pEnd - e) / e;
+      for (const e of shorts) float_ += perGridCap * (e - pEnd) / e;
       float_ = Math.max(float_, -R.invest - realized);
     }
 
-    pnl[i] = realized === -R.invest ? -R.invest : realized + float_;
+    pnl[i] = wiped ? -R.invest : realized + float_;
     endPx[i] = pEnd;
     if (keepPath) samplePaths.push(keepPath);
   }
@@ -287,12 +468,21 @@ function simulate(R) {
   const targetPct = TARGET_RATE * 100;
   const mean = pct.reduce((a, b) => a + b, 0) / pct.length;
 
+  // fan chart empiris
+  const fan = ckIdx.map((t, c) => {
+    const arr = Array.from(ckPx[c]).sort((a, b) => a - b);
+    return { t, p5: q(arr, 0.05), p50: q(arr, 0.5), p95: q(arr, 0.95) };
+  });
+
+  const pTarget = prob((x) => x >= targetPct);
+  const se = Math.sqrt(Math.max(1e-9, pTarget * (1 - pTarget) / N_SIM)) * 100; // margin error binomial
+
   return {
-    pct, samplePaths, mean, targetPct,
+    pct, samplePaths, mean, targetPct, fan, nSteps: n,
     median: q(pct, 0.5), p5: q(pct, 0.05), p95: q(pct, 0.95),
     pxP5: q(px, 0.05), pxP50: q(px, 0.5), pxP95: q(px, 0.95),
     pWin: prob((x) => x > 0),
-    pTarget: prob((x) => x >= targetPct),   // ← CONFIDENCE
+    pTarget, se,                              // ← CONFIDENCE ± SE
     p1: prob((x) => x >= 1),
     pLiq: liqCount / N_SIM, pSL: slCount / N_SIM,
   };
@@ -315,7 +505,7 @@ function renderMarket(q, vol) {
   b.textContent = q.demo ? '● DEMO' : '● LIVE';
 }
 
-function renderTrend(T, R, sim) {
+function renderTrend(T, H, R, sim) {
   const lb = $('trLabel');
   lb.textContent = T.label;
   lb.className = 'v ' + T.cls;
@@ -323,8 +513,19 @@ function renderTrend(T, R, sim) {
   $('trDrift').className = 'v ' + pctCls(T.slope);
   $('trR2').textContent = (T.r2 * 100).toFixed(0) + '%';
 
+  // ---- regime posterior HMM
+  const names = ['BULL', 'SIDE', 'BEAR'], clss = ['up', '', 'dn'];
+  const bars = H.alpha.map((p, k) =>
+    `<div><div class="k">P(${names[k]})</div><div class="v ${clss[k]}">${(p * 100).toFixed(0)}%</div>
+     <div class="bar"><i style="width:${Math.min(100, p * 100)}%"></i></div></div>`).join('');
+  $('hmmRow').innerHTML = bars;
+  const dom = H.alpha.indexOf(Math.max(...H.alpha));
+  $('hmmNote').textContent = R.useHMM
+    ? `Filter HMM (forward algorithm pada 4 return CMC) → regime dominan saat ini: ${names[dom]} (${(H.alpha[dom] * 100).toFixed(0)}%). Simulasi menyampel regime awal dari distribusi ini dan regime boleh berpindah tiap jam.`
+    : 'Mode GBM klasik aktif — posterior regime hanya ditampilkan sebagai referensi, simulasi memakai drift regresi trend.';
+
   $('trPred').innerHTML =
-    `Prediksi H+${R.days} (dari ${N_SIM.toLocaleString()} simulasi): ` +
+    `Prediksi H+${R.days} (${R.useHMM ? 'HMM regime-switching' : 'GBM'}, ${N_SIM.toLocaleString()} simulasi): ` +
     `<b>P50 $${fmt(sim.pxP50)}</b> · band 90% $${fmt(sim.pxP5)} – $${fmt(sim.pxP95)}`;
 
   let note = '';
@@ -347,9 +548,9 @@ function renderReco(R, sim) {
   const dirLabel = R.fut ? { long: 'Long', short: 'Short', neutral: 'Neutral' }[R.dir] : 'Spot (Neutral)';
   $('recoTitle').textContent = `Rekomendasi ${S.coin}/USDT — ${R.fut ? 'Futures Grid' : 'Grid Trading'} · ${dirLabel}`;
 
-  // CONFIDENCE = % simulasi yang mencapai target (≥ 0.3% dari investasi)
+  // CONFIDENCE = % simulasi yang mencapai target (≥ 0.3% dari investasi) ± SE
   const conf = sim.pTarget * 100;
-  $('recoBadge').textContent = 'CONFIDENCE ' + conf.toFixed(0) + '%';
+  $('recoBadge').textContent = `CONFIDENCE ${conf.toFixed(0)}% ±${sim.se.toFixed(1)}`;
   $('recoBadge').className = 'badge ' + (conf >= 55 ? 'live' : 'demo');
 
   let h = '';
@@ -372,8 +573,8 @@ function renderReco(R, sim) {
   h += frow('Stop Loss', 'stop by price', fmt(R.sl), fmt(R.sl));
   h += frow('Grid mode', 'pilih', 'Arithmetic');
   if (R.liq) h += frow('Est. liq price', 'pembanding — jaga SL sebelum liq', fmt(R.liq));
-  h += frow('Confidence', `${N_SIM.toLocaleString()} sim · % path dgn PnL ≥ ${fmt(R.targetUsd, 2)} USDT`,
-    conf.toFixed(1) + '%');
+  h += frow('Confidence', `${N_SIM.toLocaleString()} sim (${R.useHMM ? 'HMM' : 'GBM'}) · % path dgn PnL ≥ ${fmt(R.targetUsd, 2)} USDT`,
+    conf.toFixed(1) + '% ± ' + sim.se.toFixed(1) + '%');
   $('recoBody').innerHTML = h;
 
   $('recoBody').querySelectorAll('.cp').forEach((b) =>
@@ -389,7 +590,7 @@ function renderStats(R, sim) {
     `<div><div class="k">${k}</div><div class="v ${cls}">${v}</div>${
       barPct == null ? '' : `<div class="bar"><i style="width:${Math.min(100, barPct)}%"></i></div>`}</div>`;
   $('simStats').innerHTML =
-    cell(`P(≥ target ${tUsd} USDT)`, (sim.pTarget * 100).toFixed(1) + '%', sim.pTarget >= 0.55 ? 'up' : '', sim.pTarget * 100) +
+    cell(`P(≥ target ${tUsd} USDT)`, (sim.pTarget * 100).toFixed(1) + '% ±' + sim.se.toFixed(1), sim.pTarget >= 0.55 ? 'up' : '', sim.pTarget * 100) +
     cell('P(PnL > 0)', (sim.pWin * 100).toFixed(1) + '%', sim.pWin >= 0.5 ? 'up' : 'dn', sim.pWin * 100) +
     cell('P(profit ≥ +1%)', (sim.p1 * 100).toFixed(1) + '%', '', sim.p1 * 100) +
     cell('Median PnL', pctTxt(sim.median) + ' (' + fmt(sim.median * R.invest / 100, 2) + ' USDT)', pctCls(sim.median)) +
@@ -397,7 +598,8 @@ function renderStats(R, sim) {
     cell(R.liq ? 'P(likuidasi) / P(SL)' : 'P(stop loss)',
          (R.liq ? (sim.pLiq * 100).toFixed(1) + '% / ' : '') + (sim.pSL * 100).toFixed(1) + '%',
          (sim.pLiq + sim.pSL) > 0.2 ? 'dn' : '');
-  $('simMeta').textContent = `MONTE CARLO · ${N_SIM.toLocaleString()} PATH · ${R.days} HARI · σ ${(R.vol * 100).toFixed(2)}%/HARI · DRIFT ${(R.mu * 100).toFixed(2)}%/HARI`;
+  $('simMeta').textContent =
+    `MONTE CARLO · ${R.useHMM ? 'HMM 3-REGIME' : 'GBM'} · ${N_SIM.toLocaleString()} PATH · ANTITHETIC · FAT-TAIL · ${R.days} HARI · σ ${(R.vol * 100).toFixed(2)}%/HARI`;
 }
 
 // ---------- charts (canvas, tanpa library) ----------
@@ -412,14 +614,12 @@ function drawSpark(T) {
   const X = (i) => padL + (i / (ps.length - 1)) * (W - padL - padR);
   const Y = (v) => padT + (1 - (v - mn) / span) * (H - padT - padB);
 
-  // garis trend (warna sesuai arah)
   ctx.strokeStyle = css(T.cls === 'dn' ? '--red' : T.cls === 'up' ? '--green' : '--ink');
   ctx.lineWidth = 1.5;
   ctx.beginPath();
   ps.forEach((v, i) => (i ? ctx.lineTo(X(i), Y(v)) : ctx.moveTo(X(0), Y(v))));
   ctx.stroke();
 
-  // titik data + label waktu
   ctx.font = '9px ui-monospace';
   T.pts.forEach((o, i) => {
     ctx.beginPath(); ctx.arc(X(i), Y(o.p), 3, 0, 7);
@@ -467,31 +667,24 @@ function drawPaths(R, sim) {
   });
   ctx.globalAlpha = 1;
 
-  // FAN PREDIKSI: median & band 90% analitik GBM (drift trend + σ)
-  const nSteps = Math.round(R.days * 24);
-  const fan = (zq, dash, col, lab) => {
-    ctx.strokeStyle = col; ctx.lineWidth = 1.4; ctx.setLineDash(dash);
-    ctx.beginPath();
-    for (let i = 0; i <= nSteps; i++) {
-      const t = i / 24;
-      const v = R.P * Math.exp((R.mu - 0.5 * R.vol * R.vol) * t + zq * R.vol * Math.sqrt(t));
-      const x = X(i, nSteps + 1), y = Y(v);
-      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
-    }
-    ctx.stroke(); ctx.setLineDash([]);
-    if (lab) {
-      const vEnd = R.P * Math.exp((R.mu - 0.5 * R.vol * R.vol) * R.days + zq * R.vol * Math.sqrt(R.days));
-      ctx.fillStyle = col; ctx.font = '9px ui-monospace';
-      ctx.fillText(lab, W - padR - 30, Y(vEnd) - 4);
-    }
-  };
+  // FAN PREDIKSI EMPIRIS: kuantil dari 5.000 path (bukan rumus GBM)
   const amber = css('--amber');
-  fan(0, [6, 3], amber, 'P50');
-  fan(1.645, [2, 3], amber, 'P95');
-  fan(-1.645, [2, 3], amber, 'P5');
+  const fanLine = (key, dash, lab) => {
+    ctx.strokeStyle = amber; ctx.lineWidth = 1.4; ctx.setLineDash(dash);
+    ctx.beginPath();
+    ctx.moveTo(X(0, sim.nSteps + 1), Y(R.P));
+    sim.fan.forEach((f) => ctx.lineTo(X(f.t, sim.nSteps + 1), Y(f[key])));
+    ctx.stroke(); ctx.setLineDash([]);
+    const last = sim.fan[sim.fan.length - 1];
+    ctx.fillStyle = amber; ctx.font = '9px ui-monospace';
+    ctx.fillText(lab, W - padR - 30, Y(last[key]) - 4);
+  };
+  fanLine('p50', [6, 3], 'P50');
+  fanLine('p95', [2, 3], 'P95');
+  fanLine('p5', [2, 3], 'P5');
 
   ctx.fillStyle = css('--muted'); ctx.font = '10px ui-monospace';
-  ctx.fillText('60 SAMPLE PATH DARI ' + N_SIM.toLocaleString() + ' — HIJAU = RANGE GRID · ORANYE = PROYEKSI TREND P5/P50/P95', padL, H - 5);
+  ctx.fillText('60 SAMPLE PATH DARI ' + N_SIM.toLocaleString() + ' — HIJAU = RANGE GRID · ORANYE = FAN EMPIRIS P5/P50/P95', padL, H - 5);
 }
 
 function drawHist(sim) {
@@ -509,7 +702,6 @@ function drawHist(sim) {
     ctx.fillStyle = c >= sim.targetPct ? css('--green') : c >= 0 ? '#9CC7A6' : css('--red');
     ctx.fillRect(X(i) + 1, H - padB - h, (W - padL - padR) / bins - 2, h);
   }
-  // garis 0% dan garis target
   [[0, css('--ink'), '0%'], [sim.targetPct, css('--green'), 'TARGET +' + sim.targetPct.toFixed(2) + '%']]
     .forEach(([v, col, lab]) => {
       if (v < lo || v > hi) return;
@@ -527,15 +719,16 @@ $('btnGo').addEventListener('click', async () => {
   const btn = $('btnGo');
   btn.disabled = true; btn.textContent = 'MENGAMBIL HARGA…';
   const q = await getQuote(S.coin);
-  btn.textContent = 'MENJALANKAN 5.000 SIMULASI…';
+  btn.textContent = `MENJALANKAN ${N_SIM.toLocaleString()} SIMULASI (${S.model.toUpperCase()})…`;
   await new Promise((r) => setTimeout(r, 30)); // biarkan UI update
 
   const vol = dailyVol(q);
   const T = buildTrend(q, vol);
-  const R = buildReco(q, T);
+  const H = buildHMM(q, vol);
+  const R = buildReco(q, T, H);
   renderMarket(q, R.vol);
-  const sim = simulate(R);
-  renderTrend(T, R, sim);
+  const sim = simulate(R, H);
+  renderTrend(T, H, R, sim);
   renderReco(R, sim);
   renderStats(R, sim);
   drawPaths(R, sim);
