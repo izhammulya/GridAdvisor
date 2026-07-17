@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>GRIDFISH · Pionex Grid Advisor — LINK / SOL / ETH</title>
+<title>GRIDFISH · Pionex Grid Advisor — LINK / SOL / ETH / INJ</title>
 <style>
   :root{
     --paper:#F6F5F0; --panel:#FFFFFF; --ink:#17181A; --muted:#8B887E;
@@ -73,6 +73,7 @@
   .trend3 .v{font-size:13px; font-weight:700; margin-top:2px}
   #trPred{padding:10px 14px; font-size:11px; border-top:1px solid var(--line-soft)}
   #trNote{padding:8px 14px 12px; font-size:11px; color:var(--muted)}
+  #hmmNote{padding:8px 14px 4px; font-size:11px; color:var(--muted); border-top:1px solid var(--line-soft)}
 
   /* ------ pionex form card (signature) ------ */
   .pnx .frow{display:flex; justify-content:space-between; align-items:center; gap:10px;
@@ -107,7 +108,7 @@
       <div class="dot">◦</div>
       <div>
         <h1>GRIDFISH · <b>PIONEX GRID ADVISOR</b></h1>
-        <span class="tag">LINK · SOL · ETH — GRID SPOT &amp; FUTURES · TARGET 0.30% (0.15 USDT / 50 USDT)</span>
+        <span class="tag">LINK · SOL · ETH · INJ — GRID SPOT &amp; FUTURES · TARGET 0.30% (0.15 USDT / 50 USDT)</span>
       </div>
     </div>
     <div style="text-align:right">
@@ -128,6 +129,7 @@
               <button data-v="LINK" class="on">LINK</button>
               <button data-v="SOL">SOL</button>
               <button data-v="ETH">ETH</button>
+              <button data-v="INJ">INJ</button>
             </div>
           </div>
           <div class="fld">
@@ -135,6 +137,13 @@
             <div class="seg" id="segProd">
               <button data-v="spot" class="on">Grid Spot</button>
               <button data-v="fut">Futures Grid</button>
+            </div>
+          </div>
+          <div class="fld">
+            <label>Model Simulasi</label>
+            <div class="seg" id="segModel">
+              <button data-v="hmm" class="on">HMM Regime</button>
+              <button data-v="gbm">GBM Klasik</button>
             </div>
           </div>
           <div class="fld hide" id="fldDir">
@@ -166,7 +175,7 @@
             </div>
           </div>
           <button class="go" id="btnGo">Minta Rekomendasi</button>
-          <div class="note">Target profit otomatis: <b>0.30% dari investasi</b> (50 USDT → 0.15 USDT; 100 USDT → 0.30 USDT). Grid Spot memakai aturan <b>point ÷ pembagi + 1</b>. Harga di-fetch ke CoinMarketCap <b>hanya saat tombol ditekan</b> (cache 60 dtk).</div>
+          <div class="note">Target profit otomatis: <b>0.30% dari investasi</b> (50 USDT → 0.15 USDT; 100 USDT → 0.30 USDT). Grid Spot memakai aturan <b>point ÷ pembagi + 1</b>. <b>HMM Regime</b> = simulasi 3-regime (Bull/Sideways/Bear) yang di-filter dari data return CMC; <b>GBM Klasik</b> = model lama sebagai pembanding. Harga di-fetch ke CoinMarketCap <b>hanya saat tombol ditekan</b> (cache 60 dtk).</div>
         </div>
       </div>
 
@@ -183,7 +192,7 @@
       </div>
 
       <div class="card" style="margin-top:12px" id="cardTrend">
-        <div class="hd"><span class="t">Analisa Trend Series</span><span class="tag">REGRESI LOG-PRICE · 30D→NOW</span></div>
+        <div class="hd"><span class="t">Analisa Trend &amp; Regime</span><span class="tag">REGRESI + HMM FILTER · 30D→NOW</span></div>
         <div class="bd" style="padding-bottom:6px">
           <canvas id="cvSpark" width="620" height="150"></canvas>
         </div>
@@ -192,6 +201,12 @@
           <div><div class="k">Drift / hari</div><div class="v" id="trDrift">—</div></div>
           <div><div class="k">Kekuatan R²</div><div class="v" id="trR2">—</div></div>
         </div>
+        <div class="trend3" id="hmmRow">
+          <div><div class="k">P(BULL)</div><div class="v">—</div></div>
+          <div><div class="k">P(SIDE)</div><div class="v">—</div></div>
+          <div><div class="k">P(BEAR)</div><div class="v">—</div></div>
+        </div>
+        <div id="hmmNote">Posterior regime HMM muncul setelah rekomendasi dijalankan.</div>
         <div id="trPred">—</div>
         <div id="trNote">Tekan "Minta Rekomendasi" untuk melihat trend &amp; prediksi.</div>
       </div>
@@ -207,15 +222,16 @@
         <div id="recoBody">
           <div class="bd" style="color:var(--muted)">Pilih koin &amp; produk, lalu tekan <b>Minta Rekomendasi</b>.<br>
           Grid Spot dihitung dengan aturan custom: <b>jumlah grid = (range dalam point ÷ pembagi) + 1</b>
-          — LINK &lt;10: pembagi 2, harga 10–20: pembagi 3, 20–30: pembagi 4, dst. Confidence = persentase
-          dari 5.000 simulasi yang mencapai target 0.30% (0.15 USDT per 50 USDT).</div>
+          — LINK/INJ &lt;10–20: pembagi 2–3, harga 10–20: pembagi 3, 20–30: pembagi 4, dst. Confidence = persentase
+          dari 5.000 simulasi yang mencapai target 0.30% (0.15 USDT per 50 USDT), ditampilkan
+          dengan margin error ± supaya noise simulasi terlihat.</div>
         </div>
       </div>
 
       <div class="card" style="margin-top:12px">
         <div class="hd">
           <span class="t">Probability Lattice — 5.000 Simulasi</span>
-          <span class="tag" id="simMeta">MONTE CARLO · GBM + DRIFT TREND</span>
+          <span class="tag" id="simMeta">MONTE CARLO · HMM REGIME-SWITCHING</span>
         </div>
         <div class="bd" style="padding-bottom:6px">
           <canvas id="cvPaths" width="960" height="240"></canvas>
@@ -227,7 +243,7 @@
       </div>
 
       <div class="disc">
-        ⚠ <b>Bukan nasihat keuangan.</b> Simulasi Monte Carlo adalah model probabilistik dari volatilitas &amp; trend historis — bukan prediksi. Target 0.30% tidak dijamin; grid spot bisa mengalami floating loss saat downtrend, dan futures dengan leverage dapat terlikuidasi hingga kehilangan seluruh margin. Gunakan dana yang siap Anda hilangkan, dan verifikasi setiap angka sebelum menekan "Create" di Pionex.
+        ⚠ <b>Bukan nasihat keuangan.</b> Simulasi Monte Carlo (termasuk mode HMM) adalah model probabilistik dari volatilitas &amp; trend historis — bukan prediksi. Confidence dan probabilitas hanya seakurat asumsi modelnya. Target 0.30% tidak dijamin; grid spot bisa mengalami floating loss saat downtrend, dan futures dengan leverage dapat terlikuidasi hingga kehilangan seluruh margin. Gunakan dana yang siap Anda hilangkan, dan verifikasi setiap angka sebelum menekan "Create" di Pionex.
       </div>
     </div>
   </div>
