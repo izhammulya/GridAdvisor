@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>GRIDFISH · Pionex Grid Advisor — LINK / SOL / ETH / INJ</title>
+<title>GRIDFISH v3 · Pionex Grid Advisor — LINK / SOL / ETH / INJ</title>
 <style>
   :root{
     --paper:#F6F5F0; --panel:#FFFFFF; --ink:#17181A; --muted:#8B887E;
@@ -48,10 +48,12 @@
   .seg button.on{background:var(--ink); color:#fff; border-color:var(--ink)}
   .seg button.on.long{background:var(--green); border-color:var(--green)}
   .seg button.on.short{background:var(--red); border-color:var(--red)}
-  input[type=number]{width:100%; padding:8px 10px; font:inherit; border:1px solid var(--line); border-radius:5px; background:var(--paper)}
+  input[type=number], input[type=text]{width:100%; padding:8px 10px; font:inherit; border:1px solid var(--line); border-radius:5px; background:var(--paper)}
   .row2{display:grid; grid-template-columns:1fr 1fr; gap:8px}
+  .row3{display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px}
   .go{width:100%; padding:12px; font:inherit; font-weight:700; letter-spacing:.08em; text-transform:uppercase; font-size:12px;
     background:var(--green); color:#fff; border:0; border-radius:6px; cursor:pointer}
+  .go.repair{background:var(--amber)}
   .go:disabled{opacity:.5; cursor:wait}
   .note{font-size:11px; color:var(--muted); margin-top:8px}
 
@@ -75,7 +77,7 @@
   #trNote{padding:8px 14px 12px; font-size:11px; color:var(--muted)}
   #hmmNote{padding:8px 14px 4px; font-size:11px; color:var(--muted); border-top:1px solid var(--line-soft)}
 
-  /* ------ pionex form card (signature) ------ */
+  /* ------ pionex form card ------ */
   .pnx .frow{display:flex; justify-content:space-between; align-items:center; gap:10px;
     padding:9px 14px; border-bottom:1px dashed var(--line-soft)}
   .pnx .frow:last-child{border-bottom:0}
@@ -86,7 +88,7 @@
   .cp{font-size:10px; padding:3px 8px; border:1px solid var(--line); background:var(--paper); border-radius:4px; cursor:pointer; color:var(--muted)}
   .cp:active{background:var(--ink); color:#fff}
 
-  /* ------ sim ------ */
+  /* ------ sim & tabel ------ */
   canvas{width:100%; height:auto; display:block}
   .stats{display:grid; grid-template-columns:repeat(3,1fr); gap:0; border-top:1px solid var(--line-soft)}
   .stats div{padding:10px 12px; border-right:1px solid var(--line-soft); border-bottom:1px solid var(--line-soft)}
@@ -95,6 +97,13 @@
   .stats .v{font-size:15px; font-weight:700; margin-top:2px}
   .bar{height:8px; background:var(--line-soft); border-radius:4px; overflow:hidden; margin-top:6px}
   .bar i{display:block; height:100%; background:var(--green)}
+
+  table.rpt{width:100%; border-collapse:collapse; font-size:12px}
+  table.rpt th{font-size:9px; letter-spacing:.1em; text-transform:uppercase; color:var(--muted);
+    text-align:left; padding:8px 10px; border-bottom:1px solid var(--line-soft); white-space:nowrap}
+  table.rpt td{padding:8px 10px; border-bottom:1px dashed var(--line-soft); white-space:nowrap}
+  table.rpt tr.rec td{background:var(--green-soft)}
+  #mcInterp{padding:12px 14px; font-size:11.5px; line-height:1.7; border-top:1px solid var(--line-soft)}
 
   .disc{margin-top:14px; border:1px dashed var(--line); border-radius:8px; padding:12px 14px; font-size:11px; color:var(--muted)}
   .hide{display:none}
@@ -107,8 +116,8 @@
     <div class="logo">
       <div class="dot">◦</div>
       <div>
-        <h1>GRIDFISH · <b>PIONEX GRID ADVISOR</b></h1>
-        <span class="tag">LINK · SOL · ETH · INJ — GRID SPOT &amp; FUTURES · TARGET 0.30% (0.15 USDT / 50 USDT)</span>
+        <h1>GRIDFISH v3 · <b>PIONEX GRID ADVISOR</b></h1>
+        <span class="tag">LINK · SOL · ETH · INJ — GRID SPOT &amp; FUTURES · REPAIR BOT · MC STRESS TEST</span>
       </div>
     </div>
     <div style="text-align:right">
@@ -174,8 +183,12 @@
               <input type="number" id="inFee" value="0.05" min="0" max="0.2" step="0.01">
             </div>
           </div>
+          <div class="fld">
+            <label>Seed simulasi (opsional — isi utk hasil reproducible)</label>
+            <input type="text" id="inSeed" placeholder="kosong = acak tiap run">
+          </div>
           <button class="go" id="btnGo">Minta Rekomendasi</button>
-          <div class="note">Target profit otomatis: <b>0.30% dari investasi</b> (50 USDT → 0.15 USDT; 100 USDT → 0.30 USDT). Grid Spot memakai aturan <b>point ÷ pembagi + 1</b>. <b>HMM Regime</b> = simulasi 3-regime (Bull/Sideways/Bear) yang di-filter dari data return CMC; <b>GBM Klasik</b> = model lama sebagai pembanding. Harga di-fetch ke CoinMarketCap <b>hanya saat tombol ditekan</b> (cache 60 dtk).</div>
+          <div class="note">Target profit otomatis: <b>0.30% dari investasi</b> (50 USDT → 0.15 USDT). Grid Spot memakai aturan <b>point ÷ pembagi + 1</b>. Harga di-fetch ke CoinMarketCap <b>hanya saat tombol ditekan</b> (cache 60 dtk).</div>
         </div>
       </div>
 
@@ -210,6 +223,47 @@
         <div id="trPred">—</div>
         <div id="trNote">Tekan "Minta Rekomendasi" untuk melihat trend &amp; prediksi.</div>
       </div>
+
+      <!-- ============ REPAIR BOT INPUT ============ -->
+      <div class="card" style="margin-top:12px">
+        <div class="hd"><span class="t">Repair Bot — Input Posisi</span><span class="tag">SALIN DARI PIONEX</span></div>
+        <div class="bd">
+          <div class="fld">
+            <label>Arah bot yang rugi</label>
+            <div class="seg" id="segRpDir">
+              <button data-v="short" class="on short">Short</button>
+              <button data-v="long">Long</button>
+            </div>
+          </div>
+          <div class="row3">
+            <div class="fld"><label>Posisi (koin)</label><input type="number" id="rpQty" value="234" step="any"></div>
+            <div class="fld"><label>Avg hold price</label><input type="number" id="rpAvg" value="5.245" step="any"></div>
+            <div class="fld"><label>Harga sekarang</label><input type="number" id="rpPrice" value="5.355" step="any"></div>
+          </div>
+          <div class="row3">
+            <div class="fld"><label>Range bawah</label><input type="number" id="rpLow" value="4.90" step="any"></div>
+            <div class="fld"><label>Range atas</label><input type="number" id="rpHigh" value="5.75" step="any"></div>
+            <div class="fld"><label>Jumlah grid</label><input type="number" id="rpGrids" value="85" step="1"></div>
+          </div>
+          <div class="row3">
+            <div class="fld"><label>Qty per grid</label><input type="number" id="rpQtyGrid" value="3.6" step="any"></div>
+            <div class="fld"><label>Fee per sisi (%)</label><input type="number" id="rpFee" value="0.05" step="0.01"></div>
+            <div class="fld"><label>Liq price (Pionex)</label><input type="number" id="rpLiq" value="6.16" step="any"></div>
+          </div>
+          <div class="row3">
+            <div class="fld"><label>Total Profit skrg</label><input type="number" id="rpPnl" value="-55.83" step="any"></div>
+            <div class="fld"><label>Grid profit skrg</label><input type="number" id="rpGridProfit" value="11.86" step="any"></div>
+            <div class="fld"><label>Investasi skrg</label><input type="number" id="rpInvest" value="335.59" step="any"></div>
+          </div>
+          <div class="row3">
+            <div class="fld"><label>Saldo tersedia</label><input type="number" id="rpAvail" value="278.11" step="any"></div>
+            <div class="fld"><label>Target exit (USDT)</label><input type="number" id="rpTarget" value="1" min="1" step="any"></div>
+            <div class="fld"><label>Horizon (hari)</label><input type="number" id="rpDays" value="30" min="3" max="60" step="1"></div>
+          </div>
+          <button class="go repair" id="btnRepair">Analisa Repair</button>
+          <div class="note">Target exit minimal <b>+1 USDT</b> (dipaksa ≥ 1). Isi angka persis dari tab <i>Details</i> Pionex: posisi, avg hold, liq price, Total Profit, Grid profit. Koin memakai pilihan di atas (utk volatilitas &amp; regime); harga bisa dioverride manual.</div>
+        </div>
+      </div>
     </div>
 
     <!-- ================= RIGHT : OUTPUT ================= -->
@@ -221,29 +275,47 @@
         </div>
         <div id="recoBody">
           <div class="bd" style="color:var(--muted)">Pilih koin &amp; produk, lalu tekan <b>Minta Rekomendasi</b>.<br>
-          Grid Spot dihitung dengan aturan custom: <b>jumlah grid = (range dalam point ÷ pembagi) + 1</b>
-          — LINK/INJ &lt;10–20: pembagi 2–3, harga 10–20: pembagi 3, 20–30: pembagi 4, dst. Confidence = persentase
-          dari 5.000 simulasi yang mencapai target 0.30% (0.15 USDT per 50 USDT), ditampilkan
-          dengan margin error ± supaya noise simulasi terlihat.</div>
+          Grid Spot dihitung dengan aturan custom: <b>jumlah grid = (range dalam point ÷ pembagi) + 1</b>.
+          Confidence = persentase dari 5.000 simulasi yang mencapai target 0.30%, ± margin error.</div>
+        </div>
+      </div>
+
+      <!-- ============ REPAIR BOT OUTPUT ============ -->
+      <div class="card" style="margin-top:12px">
+        <div class="hd">
+          <span class="t">Repair Bot — Add Investment &amp; Waktu Recovery</span>
+          <span class="badge" id="repairBadge">MENUNGGU</span>
+        </div>
+        <div id="repairBody">
+          <div class="bd" style="color:var(--muted)">
+            Isi data posisi di kartu <b>Repair Bot — Input Posisi</b> (kiri bawah), lalu tekan <b>Analisa Repair</b>.
+            Aplikasi membandingkan 4 skenario add investment (0% / 25% / 50% / 100% dari saldo tersedia):
+            liq price baru, P(likuidasi), peluang &amp; median waktu recovery sampai Total Profit ≥ target exit (+1 USDT minimum).
+          </div>
         </div>
       </div>
 
       <div class="card" style="margin-top:12px">
         <div class="hd">
-          <span class="t">Probability Lattice — 5.000 Simulasi</span>
+          <span class="t">Monte Carlo Stress Test — 5.000 Simulasi</span>
           <span class="tag" id="simMeta">MONTE CARLO · HMM REGIME-SWITCHING</span>
         </div>
         <div class="bd" style="padding-bottom:6px">
-          <canvas id="cvPaths" width="960" height="240"></canvas>
+          <canvas id="cvPaths" width="960" height="220"></canvas>
+        </div>
+        <div class="bd" style="padding-top:0; padding-bottom:6px">
+          <canvas id="cvEquity" width="960" height="230"></canvas>
         </div>
         <div class="bd" style="padding-top:0">
-          <canvas id="cvHist" width="960" height="180"></canvas>
+          <canvas id="cvHist3" width="960" height="190"></canvas>
         </div>
+        <div class="bd" style="padding-top:0" id="mcSummary"></div>
+        <div id="mcInterp" style="color:var(--muted)">Tabel persentil &amp; interpretasi otomatis muncul setelah simulasi dijalankan.</div>
         <div class="stats" id="simStats"></div>
       </div>
 
       <div class="disc">
-        ⚠ <b>Bukan nasihat keuangan.</b> Simulasi Monte Carlo (termasuk mode HMM) adalah model probabilistik dari volatilitas &amp; trend historis — bukan prediksi. Confidence dan probabilitas hanya seakurat asumsi modelnya. Target 0.30% tidak dijamin; grid spot bisa mengalami floating loss saat downtrend, dan futures dengan leverage dapat terlikuidasi hingga kehilangan seluruh margin. Gunakan dana yang siap Anda hilangkan, dan verifikasi setiap angka sebelum menekan "Create" di Pionex.
+        ⚠ <b>Bukan nasihat keuangan.</b> Simulasi Monte Carlo (HMM/GBM) adalah model probabilistik dari volatilitas &amp; trend historis — bukan prediksi. Confidence, waktu recovery, dan P(likuidasi) hanya seakurat asumsi modelnya. Menambah investasi ke bot yang rugi memperbesar eksposur; futures dengan leverage dapat terlikuidasi hingga kehilangan seluruh margin. Gunakan dana yang siap Anda hilangkan, dan verifikasi setiap angka sebelum menekan tombol apa pun di Pionex.
       </div>
     </div>
   </div>
