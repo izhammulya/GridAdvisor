@@ -1,57 +1,52 @@
-/* GRIDFISH — Pionex Grid Advisor (LINK/SOL/ETH/INJ)
-   - Harga: /api/quotes (proxy CoinMarketCap, on-demand saja)
-   - Grid Spot mengikuti ATURAN CUSTOM:
-       * Target profit = 0.3% dari investasi (0.15 USDT per 50 USDT)
-       * Jumlah grid  = (range dalam "point" ÷ pembagi) + 1
-         - point LINK (harga < 10)  = 0.01  → range 7.6–8.1 = 50 point → 50/2+1 = 26 grid
-         - pembagi: harga <10 → 2, 10–20 → 3, 20–30 → 4, dst (+1 tiap kelipatan 10)
-         - SOL/ETH: satuan point diskalakan mengikuti orde harga (SOL ≈ 0.1, ETH ≈ 1)
-           INJ (harga belasan USD) memakai point 0.01 seperti LINK — semua otomatis
-           lewat pointScale().
-   - Confidence = % dari 5.000 simulasi Monte Carlo yang PnL-nya ≥ target
-     (± margin error binomial ditampilkan supaya jujur soal noise simulasi)
+/* GRIDFISH v3 — Pionex Grid Advisor (LINK/SOL/ETH/INJ)
+   ================================================================
+   BARU DI v3:
+   1. REPAIR BOT (Futures) — untuk bot yang sedang floating loss:
+      - Rekomendasi berapa Add Investment (margin tambahan) yang layak,
+        dihitung dari 4 skenario (0% / 25% / 50% / 100% dari saldo tersedia).
+      - Estimasi berapa lama bot recovery sampai Total Profit ≥ target exit
+        (default +1 USDT) via Monte Carlo first-passage-time:
+        median hari, rentang P25–P75, P(recover ≤ 7 hari), P(recover ≤ horizon).
+      - P(likuidasi) per skenario; liq price baru dihitung dgn kalibrasi
+        dari liq price yang tertera di Pionex:
+          short: liqBaru = liq0 + ΔM / (Q·(1+mmr))
+          long : liqBaru = liq0 − ΔM / (Q·(1−mmr))
+      - Selisih akuntansi Pionex (funding fee dll) dikalibrasi otomatis
+        sebagai offset konstan: offset = PnL_lapor − (gridProfit + floating).
+   2. MONTE CARLO ala "MC Stress Test" (referensi gambar user):
+      - EQUITY CURVE FAN: 60 sample path equity + garis persentil P5/P50/P95
+        empiris dari 5.000 path, berlabel nilai akhir.
+      - 3 HISTOGRAM: Total Return, Max Drawdown, Sharpe Ratio.
+      - TABEL SUMMARY persentil 5/50/95 + interpretasi otomatis (bahasa manusia).
+   3. Perbaikan teknis: RNG bisa di-seed (hasil reproducible), equity di-track
+      per jam (drawdown akurat), typed array, RNG state di-reset tiap run.
 
-   ===== MESIN SIMULASI v2 =====
-   1. HMM 3-REGIME (default): Bull / Sideways / Bear.
-      - Emisi Gaussian per regime (drift & vol berbeda), transisi Markov persisten.
-      - Filter forward dijalankan pada 4 log-return CMC (30d→7d, 7d→24h, 24h→1h,
-        1h→now) → probabilitas regime SAAT INI (bukan tebakan, tapi inferensi Bayes).
-      - Tiap path Monte Carlo menyampel regime awal dari posterior itu, lalu
-        regime boleh berpindah tiap jam mengikuti matriks transisi → volatilitas
-        clustering & perubahan trend tersimulasi, bukan GBM lurus.
-   2. GBM klasik tetap tersedia (toggle) sebagai pembanding.
-   3. Fat tails: 4% shock diambil dari distribusi 2.5σ (proksi jump/berita).
-   4. Antithetic variates: path berpasangan (+g / −g) → error Monte Carlo turun
-      tanpa menambah jumlah simulasi.
-   5. Grid engine pakai STACK ENTRY PRICE per posisi → floating PnL dihitung dari
-      entry sebenarnya, bukan aproksimasi "tengah zona". Spot dimodelkan seperti
-      Pionex asli: beli inventori awal di harga pasar untuk order jual di atas.
-   6. Fan chart P5/P50/P95 sekarang EMPIRIS dari 5.000 path (checkpoint per ~6 jam),
-      jadi konsisten dengan model apa pun yang dipilih.
-
-   Model aproksimasi — bukan jaminan profit. */
+   Aturan lama tetap: target 0.3% investasi, grid spot = point/pembagi + 1,
+   HMM 3-regime + antithetic + fat tails. Model aproksimasi — bukan jaminan. */
 
 'use strict';
 
 // ---------- state ----------
-const S = { coin: 'LINK', prod: 'spot', dir: 'long', model: 'hmm' };
+const S = { coin: 'LINK', prod: 'spot', dir: 'long', model: 'hmm', rpDir: 'short' };
 const N_SIM = 5000;
-const TARGET_RATE = 0.003; // 0.15 USDT per 50 USDT investasi
+const N_SIM_REPAIR = 1500;      // per skenario add-investment (4 skenario)
+const TARGET_RATE = 0.003;      // 0.15 USDT per 50 USDT
+const MMR = 0.005;              // maintenance margin rate (aproksimasi Pionex)
 const $ = (id) => document.getElementById(id);
 
-// harga fallback bila API key belum di-set (mode demo)
 const DEMO = {
   LINK: { price: 7.83,   change_1h: -0.3, change_24h: -2.1, change_7d: -5.4, change_30d: 4.2 },
   SOL:  { price: 145.2,  change_1h: 0.2,  change_24h: 1.8,  change_7d: -3.9, change_30d: 9.5 },
   ETH:  { price: 3412.5, change_1h: 0.1,  change_24h: 0.9,  change_7d: 2.7,  change_30d: 6.1 },
-  INJ:  { price: 13.42,  change_1h: 0.4,  change_24h: -1.2, change_7d: 3.8,  change_30d: -6.5 },
+  INJ:  { price: 5.355,  change_1h: 0.4,  change_24h: -1.2, change_7d: 3.8,  change_30d: -6.5 },
 };
 
 // ---------- segmented controls ----------
 function seg(id, key, onChange) {
-  $(id).addEventListener('click', (e) => {
+  const el = $(id); if (!el) return;
+  el.addEventListener('click', (e) => {
     const b = e.target.closest('button'); if (!b) return;
-    [...$(id).querySelectorAll('button')].forEach((x) => x.classList.remove('on', 'long', 'short'));
+    [...el.querySelectorAll('button')].forEach((x) => x.classList.remove('on', 'long', 'short'));
     b.classList.add('on');
     if (b.dataset.v === 'long') b.classList.add('long');
     if (b.dataset.v === 'short') b.classList.add('short');
@@ -67,8 +62,8 @@ seg('segProd', 'prod', () => {
 });
 seg('segDir', 'dir');
 seg('segModel', 'model');
+seg('segRpDir', 'rpDir');
 
-// jam header
 setInterval(() => { $('clock').textContent = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC'; }, 1000);
 
 // ---------- fetch harga (on-demand) ----------
@@ -83,7 +78,7 @@ async function getQuote(sym) {
   }
 }
 
-// ---------- estimasi volatilitas harian dari % change ----------
+// ---------- volatilitas harian ----------
 function dailyVol(q) {
   const c = [
     Math.abs(q.change_24h || 0),
@@ -92,26 +87,22 @@ function dailyVol(q) {
     Math.abs(q.change_1h || 0) * Math.sqrt(24),
   ].map((x) => x / 100);
   const ms = c.reduce((a, b) => a + b * b, 0) / c.length;
-  let vol = Math.sqrt(ms) * 1.15; // buffer 15%
-  return Math.min(0.12, Math.max(0.02, vol)); // clamp 2%–12% per hari
+  let vol = Math.sqrt(ms) * 1.15;
+  return Math.min(0.12, Math.max(0.02, vol));
 }
 
-// ---------- ATURAN GRID CUSTOM ----------
-// Satuan "point": LINK (harga < 10) → 0.01 sesuai definisi user.
-// Koin berharga besar diskalakan mengikuti orde harga agar step grid tetap
-// ±0.15–0.3% dari harga (SOL ~145 → 0.1; ETH ~3400 → 1; INJ ~13 → 0.01).
+// ---------- aturan grid custom ----------
 function pointScale(P) {
   const exp = Math.max(0, Math.floor(Math.log10(P)) - 1);
-  const scale = Math.pow(10, exp);           // LINK/INJ: 1, SOL: 10, ETH: 100
-  return { scale, point: 0.01 * scale };     // LINK/INJ: 0.01, SOL: 0.1, ETH: 1
+  const scale = Math.pow(10, exp);
+  return { scale, point: 0.01 * scale };
 }
-// Pembagi: harga (ternormalisasi ke skala LINK) <10 → 2, 10–20 → 3, 20–30 → 4, dst.
 function gridDivisor(P) {
   const { scale } = pointScale(P);
   return Math.max(2, Math.floor(P / scale / 10) + 2);
 }
 
-// ---------- ANALISA TREND SERIES (regresi — tetap dipakai utk label & sparkline) ----------
+// ---------- regresi trend ----------
 function buildTrend(q, vol) {
   const P = q.price;
   const pts = [
@@ -130,50 +121,38 @@ function buildTrend(q, vol) {
     sxx += (xs[i] - mx) ** 2;
     syy += (ys[i] - my) ** 2;
   }
-  const slope = sxy / sxx;                                   // drift ln-price per hari
-  const r2 = syy > 0 ? (sxy * sxy) / (sxx * syy) : 0;        // kekuatan trend 0..1
-
-  // drift GBM klasik: bobot R², diredam 50%, dibatasi ±0.5σ
+  const slope = sxy / sxx;
+  const r2 = syy > 0 ? (sxy * sxy) / (sxx * syy) : 0;
   const muSim = Math.max(-0.5 * vol, Math.min(0.5 * vol, slope * 0.5 * r2));
-
   let label = 'SIDEWAYS', cls = '';
   if (slope > 0.3 * vol && r2 > 0.3) { label = 'UPTREND'; cls = 'up'; }
   else if (slope < -0.3 * vol && r2 > 0.3) { label = 'DOWNTREND'; cls = 'dn'; }
   return { pts, slope, r2, muSim, label, cls };
 }
 
-// ---------- HMM 3-REGIME ----------
-// State 0 = BULL, 1 = SIDEWAYS, 2 = BEAR.
-// Parameter drift/vol diskalakan dari σ harian koin — jadi otomatis beradaptasi
-// per koin tanpa perlu data historis panjang.
+// ---------- HMM 3-regime ----------
 function buildHMM(q, vol) {
-  const mu = [ +0.9 * vol, 0, -0.9 * vol ];       // drift/hari per regime
-  const sg = [ 1.0 * vol, 0.75 * vol, 1.30 * vol ]; // σ/hari per regime (bear paling liar)
-  // matriks transisi PER HARI (persisten: regime crypto bertahan berhari-hari)
+  const mu = [ +0.9 * vol, 0, -0.9 * vol ];
+  const sg = [ 1.0 * vol, 0.75 * vol, 1.30 * vol ];
   const A = [
     [0.88, 0.10, 0.02],
     [0.08, 0.84, 0.08],
     [0.02, 0.10, 0.88],
   ];
-
-  // ---- observasi: 4 log-return antar snapshot CMC, dgn panjang interval berbeda
   const P = q.price;
   const p30 = P / (1 + (q.change_30d || 0) / 100);
   const p7  = P / (1 + (q.change_7d  || 0) / 100);
   const p1  = P / (1 + (q.change_24h || 0) / 100);
   const ph  = P / (1 + (q.change_1h  || 0) / 100);
   const obs = [
-    { r: Math.log(p7 / p30), L: 23 },        // 30d → 7d
-    { r: Math.log(p1 / p7),  L: 6 },         // 7d  → 24h
-    { r: Math.log(ph / p1),  L: 23 / 24 },   // 24h → 1h
-    { r: Math.log(P / ph),   L: 1 / 24 },    // 1h  → now
+    { r: Math.log(p7 / p30), L: 23 },
+    { r: Math.log(p1 / p7),  L: 6 },
+    { r: Math.log(ph / p1),  L: 23 / 24 },
+    { r: Math.log(P / ph),   L: 1 / 24 },
   ];
-
-  // ---- alat matriks kecil
   const matMul = (X, Y) => X.map((row) =>
     Y[0].map((_, j) => row.reduce((s, v, k) => s + v * Y[k][j], 0)));
   const I3 = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
-  // A^L: bagian bulat dgn perkalian berulang, sisa pecahan dgn interpolasi linier
   function matPow(L) {
     let M = I3;
     const w = Math.floor(L);
@@ -185,14 +164,10 @@ function buildHMM(q, vol) {
     }
     return M;
   }
-
-  // emisi: return interval L hari di regime k ~ N(mu_k·L, sg_k²·L)
   const emis = (r, L, k) => {
     const v = sg[k] * sg[k] * L;
     return Math.exp(-((r - mu[k] * L) ** 2) / (2 * v)) / Math.sqrt(2 * Math.PI * v);
   };
-
-  // ---- forward filter → posterior regime saat ini
   let alpha = [1 / 3, 1 / 3, 1 / 3];
   for (const o of obs) {
     const T = matPow(o.L);
@@ -201,18 +176,12 @@ function buildHMM(q, vol) {
     const Z = upd[0] + upd[1] + upd[2];
     alpha = Z > 0 ? upd.map((x) => x / Z) : [1 / 3, 1 / 3, 1 / 3];
   }
-
-  // matriks transisi per-JAM utk simulasi (aproksimasi generator)
   const dt = 1 / 24;
   const Ah = A.map((row, i) => row.map((v, j) => (i === j ? 1 + dt * (v - 1) : dt * v)));
-  // kumulatif utk sampling cepat
   const AhCum = Ah.map((row) => [row[0], row[0] + row[1], 1]);
   const piCum = [alpha[0], alpha[0] + alpha[1], 1];
-
-  // drift efektif (utk geser range & label): E[mu] posterior, diredam 60%
   const muExp0 = alpha[0] * mu[0] + alpha[1] * mu[1] + alpha[2] * mu[2];
   const muEff = Math.max(-0.5 * vol, Math.min(0.5 * vol, muExp0 * 0.6));
-
   return { mu, sg, A, Ah, AhCum, alpha, piCum, muEff };
 }
 
@@ -229,39 +198,31 @@ function buildReco(q, T, H) {
 
   const vol = dailyVol(q);
   const horizonVol = vol * Math.sqrt(days);
-  const z = 1.28; // ~80% containment
-
-  // drift utk penggeseran range & fan: HMM → E[mu] posterior; GBM → regresi trend
+  const z = 1.28;
   const mu = useHMM ? H.muEff : T.muSim;
   const centerShift = Math.exp(mu * days * 0.5);
 
-  // range menurut arah
   let lowM = z, highM = z;
   if (dir === 'long') { lowM = 1.25 * z; highM = 0.85 * z; }
   if (dir === 'short') { lowM = 0.85 * z; highM = 1.25 * z; }
   let low = P * centerShift * (1 - lowM * horizonVol);
   let high = P * centerShift * (1 + highM * horizonVol);
 
-  // ---- jumlah grid ----
   const { point } = pointScale(P);
   const divisor = gridDivisor(P);
   let grids, points = null, feeAdjusted = false;
 
-  // bulatkan range ke kelipatan point supaya hitungan point bulat & rapi
   low = Math.round(low / point) * point;
   high = Math.round(high / point) * point;
 
   if (!fut) {
-    // ATURAN CUSTOM (Grid Spot): grid = point/pembagi + 1
     points = Math.round((high - low) / point);
     grids = Math.round(points / divisor) + 1;
-    // pengaman fee: pastikan profit per grid tetap positif setelah 2× fee (+buffer 0.05%)
     const minStepPct = 2 * fee + 0.0005;
     const maxGrids = Math.max(2, Math.floor((high - low) / (P * minStepPct)));
     if (grids > maxGrids) { grids = maxGrids; feeAdjusted = true; }
     grids = Math.min(200, Math.max(2, grids));
   } else {
-    // Futures: tetap pakai target profit bersih per grid ~0.35%
     const netPerGrid = 0.0035;
     const grossStepPct = netPerGrid + 2 * fee;
     grids = Math.round((high - low) / (P * grossStepPct));
@@ -269,19 +230,14 @@ function buildReco(q, T, H) {
   }
 
   const step = (high - low) / grids;
-  const profitPerGridNet = step / P - 2 * fee; // % dari modal per-grid
-
-  // target profit: 0.3% dari investasi (0.15 USDT per 50 USDT)
+  const profitPerGridNet = step / P - 2 * fee;
   const targetUsd = invest * TARGET_RATE;
-
-  // trigger, TP, SL, liq
   const trigger = dir === 'long' ? P * 0.998 : dir === 'short' ? P * 1.002 : null;
   const sl = dir === 'short' ? high * 1.02 : low * 0.98;
   const tp = dir === 'short' ? low : high;
-  const mmr = 0.005;
   const liq = !fut || dir === 'neutral' ? null
-    : dir === 'long' ? P * (1 - (1 - mmr) / lev)
-    : P * (1 + (1 - mmr) / lev);
+    : dir === 'long' ? P * (1 - (1 - MMR) / lev)
+    : P * (1 + (1 - MMR) / lev);
 
   return {
     P, days, fee, invest, fut, dir, lev, vol, low, high, grids, step,
@@ -290,61 +246,71 @@ function buildReco(q, T, H) {
   };
 }
 
-// ---------- RNG ----------
+// ---------- RNG (bisa di-seed → hasil reproducible) ----------
+let _rand = Math.random;
 let gaussSpare = null;
+function setSeed(seedStr) {
+  gaussSpare = null;
+  const s = (seedStr || '').trim();
+  if (!s) { _rand = Math.random; return; }
+  let a = 0;
+  for (let i = 0; i < s.length; i++) a = (Math.imul(a, 31) + s.charCodeAt(i)) | 0;
+  a = a >>> 0;
+  _rand = function mulberry32() {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
 function gauss() {
   if (gaussSpare !== null) { const v = gaussSpare; gaussSpare = null; return v; }
   let u = 0, v = 0, s = 0;
-  do { u = Math.random() * 2 - 1; v = Math.random() * 2 - 1; s = u * u + v * v; } while (s >= 1 || s === 0);
+  do { u = _rand() * 2 - 1; v = _rand() * 2 - 1; s = u * u + v * v; } while (s >= 1 || s === 0);
   const m = Math.sqrt(-2 * Math.log(s) / s);
   gaussSpare = v * m; return u * m;
 }
+const quantile = (sortedArr, p) =>
+  sortedArr.length ? sortedArr[Math.min(sortedArr.length - 1, Math.floor(p * sortedArr.length))] : null;
 
-// ---------- Monte Carlo 5.000 path (HMM regime-switching / GBM) ----------
+// ---------- Monte Carlo utama (HMM / GBM) + equity tracking ----------
 function simulate(R, H) {
+  setSeed($('inSeed') ? $('inSeed').value : '');
   const stepsPerDay = 24, n = Math.round(R.days * stepsPerDay), dt = 1 / stepsPerDay;
   const useHMM = R.useHMM;
-
   const notional = R.invest * R.lev;
   const perGridCap = notional / R.grids;
 
   const pnl = new Float64Array(N_SIM);
   const endPx = new Float64Array(N_SIM);
+  const maxDD = new Float64Array(N_SIM);   // % dari investasi (negatif)
+  const sharpe = new Float64Array(N_SIM);
   let liqCount = 0, slCount = 0;
-  const samplePaths = [];
+  const samplePaths = [], sampleEq = [];
 
-  // checkpoint utk fan chart empiris (per ~6 jam)
   const ckEvery = Math.max(1, Math.round(n / 28));
   const ckIdx = [];
   for (let t = ckEvery; t <= n; t += ckEvery) ckIdx.push(t);
   if (ckIdx[ckIdx.length - 1] !== n) ckIdx.push(n);
   const ckPx = ckIdx.map(() => new Float64Array(N_SIM));
+  const ckEq = ckIdx.map(() => new Float32Array(N_SIM));
+  const ckFilled = ckIdx.map(() => new Uint8Array(N_SIM));
   const ckAt = new Int16Array(n + 2).fill(-1);
   ckIdx.forEach((t, c) => { ckAt[t] = c; });
 
-  // buffer antithetic: path ganjil memakai regime & |shock| path genap dgn tanda dibalik
   const gBuf = new Float64Array(n);
   const rgBuf = new Int8Array(n);
-
-  // level harga grid: idx 0..grids → low + idx*step
   const levelOf = (p) => Math.min(R.grids, Math.max(0, Math.floor((p - R.low) / R.step)));
 
   for (let i = 0; i < N_SIM; i++) {
-    const anti = (i & 1) === 1; // path antithetic (pasangan path genap sebelumnya)
+    const anti = (i & 1) === 1;
     let p = R.P;
-
-    // ---- regime awal (HMM): sampel dari posterior filter (pasangan reuse jalur regime)
     let rg = 1;
     if (useHMM && !anti) {
-      const u = Math.random();
+      const u = _rand();
       rg = u < H.piCum[0] ? 0 : u < H.piCum[1] ? 1 : 2;
     }
 
-    // ---- inventori sebagai stack harga entry
-    // Spot (Pionex): beli inventori awal di harga pasar utk order jual di atas.
-    // Futures long: idem (posisi long utk sell order di atas).
-    // Futures short: buka short di harga pasar utk buy-back order di bawah.
-    // Futures neutral: mulai kosong — long dibuka saat harga turun, short saat naik.
     const longs = [], shorts = [];
     let level = levelOf(p);
     if (!R.fut || R.dir === 'long') {
@@ -353,17 +319,19 @@ function simulate(R, H) {
     } else if (R.dir === 'short') {
       for (let k = 0; k < level; k++) shorts.push(R.P);
     }
-    const centerLevel = level; // utk neutral
+    const centerLevel = level;
 
-    let realized = 0, dead = false, wiped = false, deadPx = 0;
+    let realized = 0, dead = false, wiped = false;
+    let eqNow = 0, peak = 0, minDd = 0;
+    let prevDayEq = 0, sumR = 0, sumR2 = 0, nD = 0;
     const keepPath = i < 60 ? [p] : null;
+    const keepEq = i < 60 ? [0] : null;
 
     for (let t = 0; t < n; t++) {
-      // ---- regime transition per jam (anti reuse jalur regime pasangannya)
       let sigD = R.vol, muD = R.mu;
       if (useHMM) {
         if (!anti) {
-          const u = Math.random();
+          const u = _rand();
           const cum = H.AhCum[rg];
           rg = u < cum[0] ? 0 : u < cum[1] ? 1 : 2;
           rgBuf[t] = rg;
@@ -374,11 +342,10 @@ function simulate(R, H) {
       }
       const sigH = sigD * Math.sqrt(dt);
 
-      // ---- shock: antithetic (+g / −g) + fat tails (4% shock dari 2.5σ)
       let g;
       if (!anti) {
         g = gauss();
-        if (Math.random() < 0.04) g *= 2.5;
+        if (_rand() < 0.04) g *= 2.5;
         gBuf[t] = g;
       } else {
         g = -gBuf[t];
@@ -387,18 +354,25 @@ function simulate(R, H) {
       p = p * Math.exp((muD * dt - 0.5 * sigH * sigH) + sigH * g);
       if (keepPath) keepPath.push(p);
 
-      // liq / SL menghentikan path
       if (R.liq && ((R.dir === 'long' && p <= R.liq) || (R.dir === 'short' && p >= R.liq))) {
-        realized = -R.invest; dead = true; wiped = true; deadPx = p; liqCount++; break;
+        realized = -R.invest; dead = true; wiped = true; eqNow = -R.invest; liqCount++;
+        if (keepEq) keepEq.push(-100);
+        break;
       }
       if ((R.dir !== 'short' && p <= R.sl) || (R.dir === 'short' && p >= R.sl)) {
-        dead = true; deadPx = p; slCount++; break;
+        dead = true; slCount++;
+        // realisasi floating di harga SL
+        let fl = 0;
+        for (const e of longs) fl += perGridCap * (p - e) / e;
+        for (const e of shorts) fl += perGridCap * (e - p) / e;
+        eqNow = Math.max(realized + fl, -R.invest);
+        if (keepEq) keepEq.push(eqNow / R.invest * 100);
+        break;
       }
 
       const nl = levelOf(p);
       if (nl !== level) {
         if (nl > level) {
-          // harga naik melewati grid: jual long (realisasi) / buka short (neutral & short)
           for (let L = level + 1; L <= nl; L++) {
             const sellPx = R.low + L * R.step;
             if (R.dir === 'neutral' && R.fut) {
@@ -417,7 +391,6 @@ function simulate(R, H) {
             }
           }
         } else {
-          // harga turun melewati grid: beli long / tutup short (realisasi)
           for (let L = level; L > nl; L--) {
             const buyPx = R.low + (L - 1) * R.step;
             if (R.dir === 'neutral' && R.fut) {
@@ -439,56 +412,286 @@ function simulate(R, H) {
         level = nl;
       }
 
-      // checkpoint fan chart
+      // ---- equity per jam (utk fan chart, drawdown, sharpe)
+      let fl = 0;
+      for (const e of longs) fl += perGridCap * (p - e) / e;
+      for (const e of shorts) fl += perGridCap * (e - p) / e;
+      eqNow = Math.max(realized + fl, -R.invest);
+      if (eqNow > peak) peak = eqNow;
+      const dd = eqNow - peak;
+      if (dd < minDd) minDd = dd;
+      if ((t + 1) % 24 === 0) {
+        const rD = (eqNow - prevDayEq) / R.invest;
+        sumR += rD; sumR2 += rD * rD; nD++;
+        prevDayEq = eqNow;
+      }
+      if (keepEq) keepEq.push(eqNow / R.invest * 100);
+
       const ci = ckAt[t + 1];
-      if (ci >= 0) ckPx[ci][i] = p;
+      if (ci >= 0) { ckPx[ci][i] = p; ckEq[ci][i] = eqNow / R.invest * 100; ckFilled[ci][i] = 1; }
     }
 
-    const pEnd = dead ? deadPx : p;
-    // isi checkpoint kosong (path berhenti krn SL/liq) dgn harga akhirnya
-    for (let c = 0; c < ckIdx.length; c++) if (ckPx[c][i] === 0) ckPx[c][i] = pEnd;
+    const pEnd = p;
+    if (eqNow > peak) peak = eqNow;
+    if (eqNow - peak < minDd) minDd = eqNow - peak;
 
-    // ---- floating PnL dari stack entry sebenarnya
-    let float_ = 0;
-    if (!wiped) {
-      for (const e of longs) float_ += perGridCap * (pEnd - e) / e;
-      for (const e of shorts) float_ += perGridCap * (e - pEnd) / e;
-      float_ = Math.max(float_, -R.invest - realized);
+    for (let c = 0; c < ckIdx.length; c++) {
+      if (!ckFilled[c][i]) { ckPx[c][i] = pEnd; ckEq[c][i] = eqNow / R.invest * 100; }
     }
 
-    pnl[i] = wiped ? -R.invest : realized + float_;
+    pnl[i] = wiped ? -R.invest : eqNow;
     endPx[i] = pEnd;
-    if (keepPath) samplePaths.push(keepPath);
+    maxDD[i] = (minDd / R.invest) * 100;
+    if (nD >= 2) {
+      const mu_ = sumR / nD;
+      const varc = Math.max(0, sumR2 / nD - mu_ * mu_);
+      const sd = Math.sqrt(varc);
+      // winsorize ±10: dgn horizon pendek estimasi Sharpe sangat noisy
+      sharpe[i] = sd > 1e-9 ? Math.max(-10, Math.min(10, (mu_ / sd) * Math.sqrt(365))) : 0;
+    } else sharpe[i] = 0;
+
+    if (keepPath) { samplePaths.push(keepPath); sampleEq.push(keepEq); }
   }
 
   const pct = Array.from(pnl, (x) => (x / R.invest) * 100).sort((a, b) => a - b);
   const px = Array.from(endPx).sort((a, b) => a - b);
-  const q = (arr, p) => arr[Math.min(arr.length - 1, Math.floor(p * arr.length))];
+  const ddArr = Array.from(maxDD).sort((a, b) => a - b);
+  const shArr = Array.from(sharpe).sort((a, b) => a - b);
   const prob = (f) => pct.filter(f).length / pct.length;
   const targetPct = TARGET_RATE * 100;
   const mean = pct.reduce((a, b) => a + b, 0) / pct.length;
 
-  // fan chart empiris
   const fan = ckIdx.map((t, c) => {
     const arr = Array.from(ckPx[c]).sort((a, b) => a - b);
-    return { t, p5: q(arr, 0.05), p50: q(arr, 0.5), p95: q(arr, 0.95) };
+    return { t, p5: quantile(arr, 0.05), p50: quantile(arr, 0.5), p95: quantile(arr, 0.95) };
+  });
+  const eqFan = ckIdx.map((t, c) => {
+    const arr = Array.from(ckEq[c]).sort((a, b) => a - b);
+    return { t, p5: quantile(arr, 0.05), p50: quantile(arr, 0.5), p95: quantile(arr, 0.95) };
   });
 
   const pTarget = prob((x) => x >= targetPct);
-  const se = Math.sqrt(Math.max(1e-9, pTarget * (1 - pTarget) / N_SIM)) * 100; // margin error binomial
+  const se = Math.sqrt(Math.max(1e-9, pTarget * (1 - pTarget) / N_SIM)) * 100;
 
   return {
-    pct, samplePaths, mean, targetPct, fan, nSteps: n,
-    median: q(pct, 0.5), p5: q(pct, 0.05), p95: q(pct, 0.95),
-    pxP5: q(px, 0.05), pxP50: q(px, 0.5), pxP95: q(px, 0.95),
+    pct, samplePaths, sampleEq, mean, targetPct, fan, eqFan, nSteps: n,
+    ddArr, shArr,
+    median: quantile(pct, 0.5), p5: quantile(pct, 0.05), p95: quantile(pct, 0.95),
+    ddP5: quantile(ddArr, 0.05), ddP50: quantile(ddArr, 0.5), ddP95: quantile(ddArr, 0.95),
+    shP5: quantile(shArr, 0.05), shP50: quantile(shArr, 0.5), shP95: quantile(shArr, 0.95),
+    pxP5: quantile(px, 0.05), pxP50: quantile(px, 0.5), pxP95: quantile(px, 0.95),
     pWin: prob((x) => x > 0),
-    pTarget, se,                              // ← CONFIDENCE ± SE
+    pTarget, se,
     p1: prob((x) => x >= 1),
     pLiq: liqCount / N_SIM, pSL: slCount / N_SIM,
   };
 }
 
-// ---------- render ----------
+// ================================================================
+// REPAIR BOT — futures grid yang sedang rugi
+// ================================================================
+function readRepairCfg(q) {
+  const num = (id, d) => { const v = +$(id).value; return isFinite(v) ? v : d; };
+  const dir = S.rpDir;
+  const Q0 = Math.abs(num('rpQty', 234));
+  const avg = num('rpAvg', 5.245);
+  const P0 = num('rpPrice', 0) > 0 ? num('rpPrice', 0) : q.price;
+  const low = num('rpLow', 4.9);
+  const high = num('rpHigh', 5.75);
+  const grids = Math.max(2, Math.round(num('rpGrids', 85)));
+  const qty = Math.max(1e-9, num('rpQtyGrid', 3.6));
+  const fee = Math.max(0, num('rpFee', 0.05)) / 100;
+  const pnlNow = num('rpPnl', -55.83);
+  const gridNow = num('rpGridProfit', 11.86);
+  const invest = Math.max(1, num('rpInvest', 335.59));
+  const avail = Math.max(0, num('rpAvail', 278.11));
+  const liq0 = num('rpLiq', 6.16);
+  const target = Math.max(1, num('rpTarget', 1));     // exit minimal +1 USDT
+  const days = Math.min(60, Math.max(3, Math.round(num('rpDays', 30))));
+  const fl0 = dir === 'short' ? Q0 * (avg - P0) : Q0 * (P0 - avg);
+  const offset = pnlNow - gridNow - fl0;              // kalibrasi funding/akuntansi Pionex
+  return { dir, Q0, avg, P0, low, high, grids, qty, fee, pnlNow, gridNow, invest, avail, liq0, target, days, fl0, offset };
+}
+
+function liqAfterAdd(c, add) {
+  if (c.Q0 <= 0) return c.liq0;
+  return c.dir === 'short'
+    ? c.liq0 + add / (c.Q0 * (1 + MMR))
+    : c.liq0 - add / (c.Q0 * (1 - MMR));
+}
+
+function simRepairScenario(c, H, add) {
+  const n = c.days * 24, dt = 1 / 24;
+  const step = (c.high - c.low) / c.grids;
+  const liqP = liqAfterAdd(c, add);
+  const short = c.dir === 'short';
+  const nUnits = Math.max(1, Math.round(c.Q0 / c.qty));
+  const levelOf = (p) => Math.min(c.grids, Math.max(0, Math.floor((p - c.low) / step)));
+
+  const recHours = [];
+  let liqN = 0;
+  const endTotals = [];
+
+  for (let i = 0; i < N_SIM_REPAIR; i++) {
+    let p = c.P0;
+    const u0 = _rand();
+    let rg = u0 < H.piCum[0] ? 0 : u0 < H.piCum[1] ? 1 : 2;
+
+    // stack posisi eksisting: semua unit di avg hold price
+    const stack = new Array(nUnits).fill(c.avg);
+    let level = levelOf(p);
+    let gridCum = 0, done = false;
+
+    for (let t = 0; t < n; t++) {
+      const u = _rand();
+      const cum = H.AhCum[rg];
+      rg = u < cum[0] ? 0 : u < cum[1] ? 1 : 2;
+      const sigH = H.sg[rg] * Math.sqrt(dt);
+      let g = gauss();
+      if (_rand() < 0.04) g *= 2.5;
+      p = p * Math.exp((H.mu[rg] * dt - 0.5 * sigH * sigH) + sigH * g);
+
+      // likuidasi?
+      if ((short && p >= liqP) || (!short && p <= liqP)) { liqN++; done = true; break; }
+
+      const nl = levelOf(p);
+      if (nl !== level) {
+        if (nl > level) {
+          for (let L = level + 1; L <= nl; L++) {
+            const px = c.low + L * step;
+            if (short) {
+              if (stack.length < c.grids) stack.push(px);            // buka short baru
+            } else if (stack.length) {
+              const e = stack.pop();                                  // tutup long (profit)
+              gridCum += c.qty * (px - e) - c.fee * c.qty * (px + e);
+            }
+          }
+        } else {
+          for (let L = level; L > nl; L--) {
+            const px = c.low + (L - 1) * step;
+            if (short) {
+              if (stack.length) {
+                const e = stack.pop();                                // tutup short (profit)
+                gridCum += c.qty * (e - px) - c.fee * c.qty * (px + e);
+              }
+            } else if (stack.length < c.grids) {
+              stack.push(px);                                         // buka long baru
+            }
+          }
+        }
+        level = nl;
+      }
+
+      // total profit bot (mengikuti angka "Total Profit" Pionex)
+      let fl = 0;
+      for (const e of stack) fl += short ? c.qty * (e - p) : c.qty * (p - e);
+      const total = c.gridNow + gridCum + fl + c.offset;
+      if (total >= c.target) { recHours.push(t + 1); done = true; break; }
+    }
+
+    if (!done) {
+      let fl = 0;
+      for (const e of stack) fl += short ? c.qty * (e - p) : c.qty * (p - e);
+      endTotals.push(c.gridNow + gridCum + fl + c.offset);
+    }
+  }
+
+  recHours.sort((a, b) => a - b);
+  endTotals.sort((a, b) => a - b);
+  const pRec = recHours.length / N_SIM_REPAIR;
+  return {
+    add, liqP,
+    pRec,
+    pLiq: liqN / N_SIM_REPAIR,
+    pRec7: recHours.filter((h) => h <= 7 * 24).length / N_SIM_REPAIR,
+    d25: quantile(recHours, 0.25) / 24 || null,
+    d50: quantile(recHours, 0.5) / 24 || null,
+    d75: quantile(recHours, 0.75) / 24 || null,
+    endMed: quantile(endTotals, 0.5),
+  };
+}
+
+async function runRepair() {
+  const btn = $('btnRepair');
+  btn.disabled = true; btn.textContent = 'MENGAMBIL HARGA…';
+  const q = await getQuote(S.coin);
+  const c = readRepairCfg(q);
+  btn.textContent = `SIMULASI 4 SKENARIO × ${N_SIM_REPAIR.toLocaleString()}…`;
+  await new Promise((r) => setTimeout(r, 30));
+
+  setSeed($('inSeed') ? $('inSeed').value : '');
+  const vol = dailyVol(q);
+  const H = buildHMM(q, vol);
+
+  const adds = [...new Set([0, 0.25, 0.5, 1].map((f) => Math.round(c.avail * f)))];
+  const rows = adds.map((a) => simRepairScenario(c, H, a));
+
+  // rekomendasi: add terkecil dgn P(liq) ≤ 5% dan P(recover) ≥ 50%;
+  // fallback: P(liq) ≤ 5%; fallback terakhir: skenario paling aman.
+  let rec = rows.find((r) => r.pLiq <= 0.05 && r.pRec >= 0.5)
+        || rows.find((r) => r.pLiq <= 0.05)
+        || rows[rows.length - 1];
+
+  renderRepair(c, rows, rec, q);
+  btn.disabled = false; btn.textContent = 'Analisa Repair';
+}
+
+function renderRepair(c, rows, rec, q) {
+  const dirLab = c.dir === 'short' ? 'Short' : 'Long';
+  const fD = (d) => (d == null ? '>' + c.days : d.toFixed(1));
+  let h = `<div class="bd" style="padding-bottom:6px">
+    <div class="tag">POSISI SAAT INI — ${S.coin} FUTURES ${dirLab.toUpperCase()}${q.demo ? ' · HARGA DEMO' : ''}</div>
+    <div style="font-size:12px; margin-top:4px">
+      ${c.Q0} koin @ avg ${fmt(c.avg, 4)} · harga ${fmt(c.P0, 4)} · Total PnL <b class="${pctCls(c.pnlNow)}">${fmt(c.pnlNow, 2)} USDT</b> ·
+      floating model ${fmt(c.fl0, 2)} · offset kalibrasi (funding dll) ${fmt(c.offset, 2)} USDT
+    </div>
+  </div>
+  <div style="overflow-x:auto"><table class="rpt">
+    <tr><th>Add (USDT)</th><th>Liq baru</th><th>P(liq)</th><th>P(recover ≤${c.days}h)</th><th>P(≤7 hari)</th><th>Median hari → +${fmt(c.target, 2)}</th><th>P25–P75 hari</th></tr>`;
+  for (const r of rows) {
+    const isRec = r === rec;
+    h += `<tr class="${isRec ? 'rec' : ''}">
+      <td><b>${fmt(r.add, 0)}</b>${isRec ? ' ★' : ''}</td>
+      <td>${fmt(r.liqP, 4)}</td>
+      <td class="${r.pLiq > 0.05 ? 'dn' : 'up'}">${(r.pLiq * 100).toFixed(1)}%</td>
+      <td class="${r.pRec >= 0.5 ? 'up' : ''}">${(r.pRec * 100).toFixed(1)}%</td>
+      <td>${(r.pRec7 * 100).toFixed(1)}%</td>
+      <td><b>${fD(r.d50)}</b></td>
+      <td>${fD(r.d25)} – ${fD(r.d75)}</td>
+    </tr>`;
+  }
+  h += `</table></div>`;
+
+  const liqShiftPct = Math.abs(rec.liqP / c.P0 - 1) * 100;
+  let verdict;
+  if (rec.pLiq <= 0.05 && rec.pRec >= 0.5) {
+    verdict = `<b>Rekomendasi: tambah ${fmt(rec.add, 0)} USDT.</b> Liq price bergeser ke ${fmt(rec.liqP, 4)}
+      (${liqShiftPct.toFixed(1)}% dari harga sekarang), P(likuidasi ${c.days} hari) turun ke ${(rec.pLiq * 100).toFixed(1)}%,
+      dan ${(rec.pRec * 100).toFixed(0)}% path mencapai exit +${fmt(c.target, 2)} USDT — median <b>${fD(rec.d50)} hari</b>
+      (rentang tengah ${fD(rec.d25)}–${fD(rec.d75)} hari).`;
+  } else if (rec.pLiq <= 0.05) {
+    verdict = `<b>Rekomendasi: tambah ${fmt(rec.add, 0)} USDT untuk keamanan liq</b> (P(liq) ${(rec.pLiq * 100).toFixed(1)}%),
+      tapi peluang recovery ke +${fmt(c.target, 2)} USDT dalam ${c.days} hari hanya ${(rec.pRec * 100).toFixed(0)}%
+      — median total profit di akhir horizon ${rec.endMed == null ? '—' : fmt(rec.endMed, 2)} USDT.
+      Pertimbangkan juga opsi cut loss / perlebar horizon.`;
+  } else {
+    verdict = `<b>⚠ Tidak ada skenario yang menekan P(likuidasi) ≤ 5%.</b> Bahkan dengan seluruh saldo,
+      P(liq) masih ${(rec.pLiq * 100).toFixed(1)}%. Menambah investasi di sini berisiko "menambah uang ke posisi buruk" —
+      pertimbangkan cut loss sebagian atau tutup bot.`;
+  }
+  h += `<div class="bd" style="font-size:12px">${verdict}</div>
+  <div class="bd" style="padding-top:0; font-size:11px; color:var(--muted)">
+    Asumsi model: (1) exit dilakukan tepat saat Total Profit menyentuh +${fmt(c.target, 2)} USDT;
+    (2) selisih akuntansi Pionex (funding fee, dsb.) dianggap konstan sebesar offset kalibrasi — funding short/long ke depan tidak dimodelkan dinamis;
+    (3) liq baru dihitung linear dari liq yang tertera: ΔLiq = Add ÷ (Qty × (1±mmr));
+    (4) grid di luar range tidak membuka posisi baru. Semua angka = estimasi Monte Carlo (${N_SIM_REPAIR.toLocaleString()} path/skenario, HMM regime), bukan jaminan.
+  </div>`;
+  $('repairBody').innerHTML = h;
+  $('repairBadge').textContent = `★ ADD ${fmt(rec.add, 0)} USDT`;
+  $('repairBadge').className = 'badge ' + (rec.pLiq <= 0.05 ? 'live' : 'demo');
+}
+
+// ---------- render umum ----------
 const fmt = (x, d = 4) => x == null ? '—' : Number(x).toLocaleString('en-US', { maximumFractionDigits: d, minimumFractionDigits: Math.min(d, 2) });
 const pctCls = (x) => (x >= 0 ? 'up' : 'dn');
 const pctTxt = (x) => (x == null ? '—' : (x >= 0 ? '+' : '') + x.toFixed(2) + '%');
@@ -513,7 +716,6 @@ function renderTrend(T, H, R, sim) {
   $('trDrift').className = 'v ' + pctCls(T.slope);
   $('trR2').textContent = (T.r2 * 100).toFixed(0) + '%';
 
-  // ---- regime posterior HMM
   const names = ['BULL', 'SIDE', 'BEAR'], clss = ['up', '', 'dn'];
   const bars = H.alpha.map((p, k) =>
     `<div><div class="k">P(${names[k]})</div><div class="v ${clss[k]}">${(p * 100).toFixed(0)}%</div>
@@ -548,7 +750,6 @@ function renderReco(R, sim) {
   const dirLabel = R.fut ? { long: 'Long', short: 'Short', neutral: 'Neutral' }[R.dir] : 'Spot (Neutral)';
   $('recoTitle').textContent = `Rekomendasi ${S.coin}/USDT — ${R.fut ? 'Futures Grid' : 'Grid Trading'} · ${dirLabel}`;
 
-  // CONFIDENCE = % simulasi yang mencapai target (≥ 0.3% dari investasi) ± SE
   const conf = sim.pTarget * 100;
   $('recoBadge').textContent = `CONFIDENCE ${conf.toFixed(0)}% ±${sim.se.toFixed(1)}`;
   $('recoBadge').className = 'badge ' + (conf >= 55 ? 'live' : 'demo');
@@ -602,7 +803,44 @@ function renderStats(R, sim) {
     `MONTE CARLO · ${R.useHMM ? 'HMM 3-REGIME' : 'GBM'} · ${N_SIM.toLocaleString()} PATH · ANTITHETIC · FAT-TAIL · ${R.days} HARI · σ ${(R.vol * 100).toFixed(2)}%/HARI`;
 }
 
-// ---------- charts (canvas, tanpa library) ----------
+// ---------- summary persentil + interpretasi otomatis ----------
+function renderMcSummary(R, sim) {
+  const row = (m, p5, p50, p95, fmtFn) =>
+    `<tr><td>${m}</td><td class="${pctCls(p5)}">${fmtFn(p5)}</td><td class="${pctCls(p50)}">${fmtFn(p50)}</td><td class="${pctCls(p95)}">${fmtFn(p95)}</td></tr>`;
+  $('mcSummary').innerHTML =
+    `<table class="rpt">
+      <tr><th>Metric</th><th>P5 (buruk)</th><th>P50 (median)</th><th>P95 (bagus)</th></tr>
+      ${row('Total Return', sim.p5, sim.median, sim.p95, pctTxt)}
+      ${row('Max Drawdown', sim.ddP5, sim.ddP50, sim.ddP95, pctTxt)}
+      ${row('Sharpe Ratio', sim.shP5, sim.shP50, sim.shP95, (x) => x.toFixed(2))}
+    </table>`;
+
+  // ---- interpretasi dalam bahasa manusia
+  const usd = (p) => fmt(p * R.invest / 100, 2);
+  const shTxt = sim.shP50 >= 2 ? 'sangat baik (return jauh melebihi guncangannya)'
+    : sim.shP50 >= 1 ? 'baik (return sepadan dengan risikonya)'
+    : sim.shP50 >= 0 ? 'lemah (return kecil dibanding naik-turunnya equity)'
+    : 'negatif (strategi ini di median justru rugi terhadap risikonya)';
+  const skew = sim.mean < sim.median
+    ? 'Rata-rata < median → distribusi punya ekor kiri: sebagian kecil skenario rugi besar menyeret rata-rata turun. Jangan hanya lihat median.'
+    : 'Rata-rata ≥ median → tidak ada ekor rugi ekstrem yang dominan pada horizon ini.';
+  const riskTail = (sim.pLiq + sim.pSL) > 0.2
+    ? `⚠ ${((sim.pLiq + sim.pSL) * 100).toFixed(0)}% path berakhir kena SL/likuidasi — range/SL terlalu sempit atau leverage terlalu besar untuk volatilitas saat ini.`
+    : `Path yang mati karena SL/likuidasi hanya ${((sim.pLiq + sim.pSL) * 100).toFixed(1)}% — setting cukup lega untuk σ ${(R.vol * 100).toFixed(1)}%/hari.`;
+
+  $('mcInterp').innerHTML =
+    `<b>Cara membaca hasil di atas.</b>
+     Dari ${N_SIM.toLocaleString()} kemungkinan jalan harga selama ${R.days} hari:
+     skenario tengah (P50) menghasilkan <b>${pctTxt(sim.median)}</b> (≈ ${usd(sim.median)} USDT dari modal ${fmt(R.invest, 2)}),
+     5% skenario terburuk berakhir ≤ <b>${pctTxt(sim.p5)}</b> (≈ ${usd(sim.p5)} USDT), dan 5% terbaik ≥ <b>${pctTxt(sim.p95)}</b>.
+     Max drawdown median <b>${pctTxt(sim.ddP50)}</b> artinya di tengah perjalanan equity biasanya sempat turun sedalam itu dari puncaknya
+     — siapkan mental (dan margin) untuk itu, bukan hanya untuk angka akhirnya. Di 5% skenario terburuk, drawdown mencapai ${pctTxt(sim.ddP5)}.
+     Sharpe median ${sim.shP50.toFixed(2)} = ${shTxt}. ${skew} ${riskTail}
+     Peluang mencapai target ${fmt(R.targetUsd, 2)} USDT: <b>${(sim.pTarget * 100).toFixed(1)}% ± ${sim.se.toFixed(1)}%</b> —
+     angka ± adalah noise simulasi; dua run dengan hasil beda dalam rentang itu sama saja.`;
+}
+
+// ---------- charts ----------
 function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
 
 function drawSpark(T) {
@@ -622,7 +860,7 @@ function drawSpark(T) {
 
   ctx.font = '9px ui-monospace';
   T.pts.forEach((o, i) => {
-    ctx.beginPath(); ctx.arc(X(i), Y(o.p), 3, 0, 7);
+    ctx.beginPath(); ctx.arc(X(i), Y(o.p), 3, 0, Math.PI * 2);
     ctx.fillStyle = css('--ink'); ctx.fill();
     ctx.fillStyle = css('--muted');
     ctx.fillText(o.lab, X(i) - 10, H - 6);
@@ -641,7 +879,6 @@ function drawPaths(R, sim) {
   const X = (i, n) => padL + (i / (n - 1)) * (W - padL - padR);
   const Y = (v) => padT + (1 - (v - mn) / (mx - mn)) * (H - padT - padB);
 
-  // zona grid
   ctx.fillStyle = css('--green-soft');
   ctx.fillRect(padL, Y(R.high), W - padL - padR, Y(R.low) - Y(R.high));
   [R.low, R.high, R.P].forEach((v, i) => {
@@ -659,7 +896,6 @@ function drawPaths(R, sim) {
     ctx.fillText('LIQ ' + fmt(R.liq), 4, Y(R.liq) + 3);
   }
 
-  // 60 sample path
   ctx.globalAlpha = 0.18; ctx.strokeStyle = css('--ink'); ctx.lineWidth = 1;
   paths.forEach((p) => {
     ctx.beginPath(); p.forEach((v, i) => (i ? ctx.lineTo(X(i, p.length), Y(v)) : ctx.moveTo(X(0, p.length), Y(v))));
@@ -667,7 +903,6 @@ function drawPaths(R, sim) {
   });
   ctx.globalAlpha = 1;
 
-  // FAN PREDIKSI EMPIRIS: kuantil dari 5.000 path (bukan rumus GBM)
   const amber = css('--amber');
   const fanLine = (key, dash, lab) => {
     ctx.strokeStyle = amber; ctx.lineWidth = 1.4; ctx.setLineDash(dash);
@@ -684,34 +919,112 @@ function drawPaths(R, sim) {
   fanLine('p5', [2, 3], 'P5');
 
   ctx.fillStyle = css('--muted'); ctx.font = '10px ui-monospace';
-  ctx.fillText('60 SAMPLE PATH DARI ' + N_SIM.toLocaleString() + ' — HIJAU = RANGE GRID · ORANYE = FAN EMPIRIS P5/P50/P95', padL, H - 5);
+  ctx.fillText('HARGA — 60 SAMPLE DARI ' + N_SIM.toLocaleString() + ' · HIJAU = RANGE GRID · ORANYE = FAN P5/P50/P95', padL, H - 5);
 }
 
-function drawHist(sim) {
-  const cv = $('cvHist'), ctx = cv.getContext('2d');
+// ---------- equity curve fan (ala referensi MC stress test) ----------
+function drawEquityFan(R, sim) {
+  const cv = $('cvEquity'), ctx = cv.getContext('2d');
   ctx.clearRect(0, 0, cv.width, cv.height);
-  const W = cv.width, H = cv.height, padL = 56, padR = 10, padT = 8, padB = 22;
-  const lo = Math.max(sim.p5 * 2, sim.pct[0]), hi = Math.min(sim.p95 * 2 + 1, sim.pct[sim.pct.length - 1]);
-  const bins = 41, bw = (hi - lo) / bins, cnt = new Array(bins).fill(0);
-  sim.pct.forEach((x) => { const b = Math.min(bins - 1, Math.max(0, Math.floor((x - lo) / bw))); cnt[b]++; });
-  const mx = Math.max(...cnt);
-  const X = (i) => padL + (i / bins) * (W - padL - padR);
-  for (let i = 0; i < bins; i++) {
-    const c = lo + (i + 0.5) * bw;
-    const h = (cnt[i] / mx) * (H - padT - padB);
-    ctx.fillStyle = c >= sim.targetPct ? css('--green') : c >= 0 ? '#9CC7A6' : css('--red');
-    ctx.fillRect(X(i) + 1, H - padB - h, (W - padL - padR) / bins - 2, h);
-  }
-  [[0, css('--ink'), '0%'], [sim.targetPct, css('--green'), 'TARGET +' + sim.targetPct.toFixed(2) + '%']]
-    .forEach(([v, col, lab]) => {
-      if (v < lo || v > hi) return;
-      const x = padL + ((v - lo) / (hi - lo)) * (W - padL - padR);
-      ctx.strokeStyle = col; ctx.setLineDash([3, 3]);
-      ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, H - padB); ctx.stroke(); ctx.setLineDash([]);
-      ctx.fillStyle = col; ctx.font = '10px ui-monospace'; ctx.fillText(lab, x + 3, padT + 10);
-    });
+  const W = cv.width, H = cv.height, padL = 56, padR = 86, padT = 12, padB = 20;
+  let mn = 0, mx = 0;
+  sim.eqFan.forEach((f) => { mn = Math.min(mn, f.p5); mx = Math.max(mx, f.p95); });
+  sim.sampleEq.forEach((p) => p.forEach((v) => { if (v < mn) mn = v; if (v > mx) mx = v; }));
+  const span = (mx - mn) || 1; mn -= span * 0.06; mx += span * 0.06;
+  const X = (t) => padL + (t / sim.nSteps) * (W - padL - padR);
+  const Y = (v) => padT + (1 - (v - mn) / (mx - mn)) * (H - padT - padB);
+
+  // grid garis 0% & target
+  [[0, css('--line'), '0%'], [sim.targetPct, css('--green'), 'TARGET']].forEach(([v, col, lab]) => {
+    if (v < mn || v > mx) return;
+    ctx.strokeStyle = col; ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(padL, Y(v)); ctx.lineTo(W - padR, Y(v)); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = css('--muted'); ctx.font = '9px ui-monospace';
+    ctx.fillText(lab, 6, Y(v) + 3);
+  });
+
+  // sample equity paths (translucent)
+  ctx.globalAlpha = 0.16; ctx.lineWidth = 1; ctx.strokeStyle = css('--ink');
+  sim.sampleEq.forEach((p) => {
+    ctx.beginPath();
+    p.forEach((v, i) => (i ? ctx.lineTo(X(i * sim.nSteps / (p.length - 1)), Y(v)) : ctx.moveTo(X(0), Y(v))));
+    ctx.stroke();
+  });
+  ctx.globalAlpha = 1;
+
+  // garis persentil empiris
+  const perc = [
+    ['p95', css('--green'), 'P95'],
+    ['p50', css('--ink'),   'P50'],
+    ['p5',  css('--red'),   'P5'],
+  ];
+  ctx.font = '10px ui-monospace';
+  perc.forEach(([key, col, lab]) => {
+    ctx.strokeStyle = col; ctx.lineWidth = 1.8;
+    ctx.beginPath(); ctx.moveTo(X(0), Y(0));
+    sim.eqFan.forEach((f) => ctx.lineTo(X(f.t), Y(f[key])));
+    ctx.stroke();
+    const last = sim.eqFan[sim.eqFan.length - 1];
+    ctx.fillStyle = col;
+    ctx.fillText(`${lab} (${pctTxt(last[key])})`, W - padR + 6, Y(last[key]) + 3);
+  });
+
+  // sumbu waktu
   ctx.fillStyle = css('--muted'); ctx.font = '10px ui-monospace';
-  ctx.fillText('DISTRIBUSI PnL % TERHADAP MODAL — ' + N_SIM.toLocaleString() + ' SIMULASI · HIJAU TUA = MENCAPAI TARGET', padL, H - 6);
+  for (let d = 0; d <= R.days; d += Math.max(1, Math.round(R.days / 6))) {
+    ctx.fillText('H' + d, X(d * 24) - 6, H - 6);
+  }
+  ctx.fillText('EQUITY % MODAL — DISTRIBUSI ' + N_SIM.toLocaleString() + ' PATH', padL, padT - 2);
+}
+
+// ---------- 3 histogram: Total Return / Max Drawdown / Sharpe ----------
+function drawHist3(sim) {
+  const cv = $('cvHist3'), ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  const W = cv.width, H = cv.height, gap = 22;
+  const pw = (W - 2 * gap) / 3;
+
+  const panel = (x0, dataSorted, color, title, markers, fmtFn) => {
+    const padL = 6, padR = 6, padT = 16, padB = 26;
+    const lo = quantile(dataSorted, 0.005), hi = quantile(dataSorted, 0.995);
+    const span = (hi - lo) || 1;
+    const bins = 31, bw = span / bins, cnt = new Array(bins).fill(0);
+    dataSorted.forEach((v) => {
+      const b = Math.min(bins - 1, Math.max(0, Math.floor((v - lo) / bw)));
+      cnt[b]++;
+    });
+    const mxC = Math.max(...cnt);
+    const X = (v) => x0 + padL + ((v - lo) / span) * (pw - padL - padR);
+    for (let i = 0; i < bins; i++) {
+      const h = (cnt[i] / mxC) * (H - padT - padB);
+      ctx.fillStyle = color;
+      ctx.globalAlpha = 0.85;
+      ctx.fillRect(x0 + padL + (i / bins) * (pw - padL - padR) + 1, H - padB - h, (pw - padL - padR) / bins - 2, h);
+    }
+    ctx.globalAlpha = 1;
+    // marker P5/P50/P95
+    markers.forEach(([p, lab]) => {
+      const v = quantile(dataSorted, p);
+      if (v < lo || v > hi) return;
+      ctx.strokeStyle = css('--ink'); ctx.setLineDash([2, 3]);
+      ctx.beginPath(); ctx.moveTo(X(v), padT); ctx.lineTo(X(v), H - padB); ctx.stroke();
+      ctx.setLineDash([]);
+    });
+    ctx.fillStyle = css('--ink'); ctx.font = '10px ui-monospace';
+    ctx.fillText(title, x0 + padL, 11);
+    ctx.fillStyle = css('--muted'); ctx.font = '9px ui-monospace';
+    ctx.fillText(fmtFn(lo), x0 + padL, H - 12);
+    const hiTxt = fmtFn(hi);
+    ctx.fillText(hiTxt, x0 + pw - padR - ctx.measureText(hiTxt).width, H - 12);
+    const med = fmtFn(quantile(dataSorted, 0.5));
+    ctx.fillText('med ' + med, x0 + pw / 2 - ctx.measureText('med ' + med).width / 2, H - 2);
+  };
+
+  const mk = [[0.05], [0.5], [0.95]];
+  panel(0,               sim.pct,   css('--green'), 'TOTAL RETURN %', mk, (v) => v.toFixed(1) + '%');
+  panel(pw + gap,        sim.ddArr, '#3D6ECC',      'MAX DRAWDOWN %', mk, (v) => v.toFixed(1) + '%');
+  panel(2 * (pw + gap),  sim.shArr, '#7A4FA3',      'SHARPE RATIO',   mk, (v) => v.toFixed(2));
 }
 
 // ---------- main ----------
@@ -720,7 +1033,7 @@ $('btnGo').addEventListener('click', async () => {
   btn.disabled = true; btn.textContent = 'MENGAMBIL HARGA…';
   const q = await getQuote(S.coin);
   btn.textContent = `MENJALANKAN ${N_SIM.toLocaleString()} SIMULASI (${S.model.toUpperCase()})…`;
-  await new Promise((r) => setTimeout(r, 30)); // biarkan UI update
+  await new Promise((r) => setTimeout(r, 30));
 
   const vol = dailyVol(q);
   const T = buildTrend(q, vol);
@@ -732,7 +1045,11 @@ $('btnGo').addEventListener('click', async () => {
   renderReco(R, sim);
   renderStats(R, sim);
   drawPaths(R, sim);
-  drawHist(sim);
+  drawEquityFan(R, sim);
+  drawHist3(sim);
+  renderMcSummary(R, sim);
 
   btn.disabled = false; btn.textContent = 'Minta Rekomendasi';
 });
+
+$('btnRepair').addEventListener('click', runRepair);
