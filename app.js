@@ -1,28 +1,25 @@
-/* GRIDFISH v4 — Pionex Grid Advisor (LINK/SOL/ETH/INJ)
+/* GRIDFISH v5 — Pionex Grid Advisor (LINK/SOL/ETH/INJ)
    ================================================================
-   PERUBAHAN v4 (akurasi & reliabilitas):
-   1. DATA: candle 1 jam x 720 (30 hari) dari Binance public API
-      (data-api.binance.vision, tanpa API key). Kalau CMC belum di-set,
-      harga & perubahan % diambil dari candle ini. Fallback ke proxy CMC/demo.
-   2. VOLATILITAS: realized vol 1 jam + EWMA (λ 0.985), bukan lagi tebakan
-      dari 4 angka % perubahan. Proxy lama diperbaiki faktornya (√(π/2)).
-   3. HMM: di-FIT dengan Baum-Welch pada 720 return 1 jam (bukan parameter
-      karangan). Drift tiap regime di-shrink 75% (estimasi drift crypto
-      sangat noisy) → simulasi tidak lagi didominasi drift ±0.9σ/hari.
-   4. FAT TAIL: campuran jump dinormalisasi → varians tetap 1
-      (v3 tanpa sadar menaikkan σ ±10%).
-   5. SUB-STEP: harga disimulasikan tiap 10 menit (bukan tiap jam) sehingga
-      grid yang tersentuh di dalam jam ikut terhitung.
-   6. LIKUIDASI DINAMIS: equity vs maintenance margin dicek tiap sub-step,
-      memperhitungkan posisi yang bertambah saat grid terisi + funding fee.
-      Liq price rekomendasi = scan harga monoton (bukan rumus posisi awal).
-   7. TAKE PROFIT disimulasikan (v3 hanya SL). Neutral futures punya SL 2 sisi.
-   8. FIRST-PASSAGE: P(target tersentuh kapan saja ≤ horizon) + median waktu.
-   9. BUG FIX: path antithetic tidak lagi membaca noise basi dari path
-      sebelumnya; chart path/equity yang mati lebih awal tidak lagi
-      "ditarik" sepanjang horizon.
-  10. REPAIR: liq dinamis terkalibrasi dari liq Pionex, fee penutupan saat
-      exit, funding fee, sub-step 15 menit.
+   PERUBAHAN v5 (akurasi & reliabilitas):
+   1. BUG KRITIS — model pengisian order grid.
+      v4 memakai level "floor" tanpa histeresis: saat harga turun melewati garis X,
+      order beli dicatat terisi di garis X−1 padahal harga belum menyentuhnya. Goyangan
+      kecil di sekitar SATU garis menghasilkan profit 1 step per goyangan → grid profit,
+      confidence & waktu-ke-target terlalu optimistis. v5 memakai state order yang benar:
+      buy menunggu di garis nb, sell di garis ns; setelah fill di garis k → nb=k−1, ns=k+1
+      (cara Pionex menaruh ulang order). Berlaku di simulasi utama, scan liq, dan repair.
+   2. INTRABAR (Brownian bridge): tiap sub-step disampel high & low di dalam langkah
+      (rumus maksimum Brownian bridge) dan dilalui O→L→H→C atau O→H→L→C. Fill grid, SL,
+      TP, likuidasi & target yang terjadi di antara titik sampel tidak lagi terlewat.
+   3. WAKTU KE TARGET: 24 jam pertama disimulasikan per 5 menit; target dicek tiap
+      sub-step & di high/low intrabar, BERSIH fee penutupan. Output: P(tercapai ≤ 15 mnt,
+      30 mnt, 1 j, 3 j, …), waktu 25/50/80%, kurva CDF, + cek silang analitik (ODE first-exit).
+   4. VOLATILITAS: Garman–Klass (OHLC) + close-to-close, EWMA, bobot tergantung horizon.
+      Level σ HMM dikalibrasi (maks ±25%) ke estimator ini; struktur regime tetap.
+   5. DIAGNOSTIK variance ratio VR(6j), VR(24j): mendeteksi mean-reversion / trending
+      yang tidak dimodelkan HMM/GBM.
+   6. SL/TP dieksekusi di harga barrier (+ slippage SL), bukan di harga sampel yang sudah lewat.
+   7. Jumlah siklus grid (close) per path ikut dilaporkan.
 
    TARGET:
    - Grid Spot   : 0.30% investasi (50 USDT → 0.15 USDT)
@@ -38,6 +35,9 @@ const S = { coin: 'LINK', prod: 'spot', dir: 'long', model: 'hmm', rpDir: 'short
 const N_SIM = 5000;
 const N_SIM_REPAIR = 1500;
 const SUB_REPAIR = 4;             // 15 menit per sub-step utk repair
+const FINE_HOURS = 24;            // 24 jam pertama: resolusi halus
+const SUB_FINE = 12;              // 5 menit per sub-step
+const SLIP = 0.0005;              // slippage eksekusi stop loss
 const TARGET_SPOT = 0.003;        // 0.30% investasi
 const TARGET_FUT = 0.01;          // 1 USDT per 100 USDT margin
 const MMR = 0.005;                // maintenance margin rate (aproksimasi Pionex)
@@ -46,7 +46,8 @@ const JUMP_NORM = 1 / Math.sqrt(1 - JUMP_P + JUMP_P * JUMP_K * JUMP_K);
 const DRIFT_SHRINK = 0.25;        // simpan 25% drift hasil estimasi
 const $ = (id) => document.getElementById(id);
 const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
-const subFor = (days) => (days <= 7 ? 6 : days <= 14 ? 4 : 2);   // sub-step per jam
+const subFor = (days) => (days <= 7 ? 6 : days <= 14 ? 4 : 2);   // sub-step per jam setelah 24 jam pertama
+const readDays = () => clamp(Math.round(+$('inDays').value || 7), 1, 30);
 
 const DEMO = {
   LINK: { price: 7.83,   change_1h: -0.3, change_24h: -2.1, change_7d: -5.4, change_30d: 4.2 },
@@ -104,7 +105,8 @@ async function getKlines(sym) {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const j = await r.json();
     if (!Array.isArray(j) || j.length < 200) throw new Error('data kurang');
-    const data = j.map((k) => ({ t: k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4] })).filter((k) => k.c > 0);
+    const data = j.map((k) => ({ t: k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4] }))
+      .filter((k) => k.c > 0 && k.o > 0 && k.h > 0 && k.l > 0);
     KL_CACHE[sym] = { at: Date.now(), data };
     return data;
   } catch (e) { return null; }
@@ -134,16 +136,54 @@ function logReturns(kl) {
   return r;
 }
 
+// ---------- variance ratio (Lo–MacKinlay, overlapping) ----------
+// VR < 1 → mean-reverting (menguntungkan grid; model random-walk jadi konservatif)
+// VR > 1 → trending (model random-walk cenderung OPTIMISTIS untuk grid)
+function varianceRatio(r, qn) {
+  const T = r.length;
+  if (T < qn * 20) return null;
+  let m = 0; for (const x of r) m += x; m /= T;
+  let v1 = 0; for (const x of r) v1 += (x - m) * (x - m); v1 /= T;
+  if (v1 <= 0) return null;
+  let s = 0; for (let i = 0; i < qn; i++) s += r[i];
+  let vq = 0, cnt = 0;
+  for (let i = qn; ; i++) {
+    vq += (s - qn * m) * (s - qn * m); cnt++;
+    if (i >= T) break;
+    s += r[i] - r[i - qn];
+  }
+  vq /= cnt;
+  const se = Math.sqrt((2 * (2 * qn - 1) * (qn - 1)) / (3 * qn * T));   // SE di bawah random walk
+  return { q: qn, vr: vq / (qn * v1), se };
+}
+
 // ---------- volatilitas harian ----------
-function dailyVol(q, kl) {
+function dailyVol(q, kl, days) {
   if (kl) {
-    const r = logReturns(kl);
-    let s2 = 0; for (const x of r) s2 += x * x;
-    const rv = s2 / r.length;
-    let ew = rv; const lam = 0.985;               // half-life ≈ 46 jam
-    for (const x of r) ew = lam * ew + (1 - lam) * x * x;
-    const sH = Math.sqrt(0.5 * rv + 0.5 * ew);
-    return { vol: clamp(sH * Math.sqrt(24), 0.01, 0.15), src: `REALIZED 1J × ${r.length}` };
+    const r = [], gk = [];
+    const c2 = 2 * Math.LN2 - 1;
+    for (let i = 1; i < kl.length; i++) {
+      const x = Math.log(kl[i].c / kl[i - 1].c);
+      if (!isFinite(x)) continue;
+      const k = kl[i];
+      const hl = Math.log(k.h / k.l), co = Math.log(k.c / k.o);
+      const g = 0.5 * hl * hl - c2 * co * co;              // Garman–Klass per bar
+      r.push(x); gk.push(isFinite(g) && g > 0 ? g : x * x);
+    }
+    const T = r.length;
+    let cc = 0, gkm = 0;
+    for (let t = 0; t < T; t++) { cc += r[t] * r[t]; gkm += gk[t]; }
+    cc /= T; gkm /= T;
+    const longRun = 0.5 * cc + 0.5 * gkm;
+    let ew = longRun; const lam = 0.985;                  // half-life ≈ 46 jam
+    for (let t = 0; t < T; t++) ew = lam * ew + (1 - lam) * (0.5 * r[t] * r[t] + 0.5 * gk[t]);
+    const wS = days <= 3 ? 0.7 : days <= 10 ? 0.5 : 0.3;  // horizon pendek → lebih percaya kondisi terkini
+    const sH = Math.sqrt(wS * ew + (1 - wS) * longRun);
+    return {
+      vol: clamp(sH * Math.sqrt(24), 0.01, 0.15),
+      src: `OHLC GK+CC 1J × ${T}`,
+      vr6: varianceRatio(r, 6), vr24: varianceRatio(r, 24),
+    };
   }
   // proxy: 1 sampel |return| per horizon. E|X| = σ√(2/π) → σ̂ = |X|·√(π/2)
   const c = [
@@ -153,7 +193,7 @@ function dailyVol(q, kl) {
     Math.abs(q.change_1h || 0) * Math.sqrt(24),
   ].map((x) => x / 100);
   const ms = c.reduce((a, b) => a + b * b, 0) / c.length;
-  return { vol: clamp(Math.sqrt(ms) * Math.sqrt(Math.PI / 2), 0.02, 0.12), src: 'PROXY 4 TITIK (KASAR)' };
+  return { vol: clamp(Math.sqrt(ms) * Math.sqrt(Math.PI / 2), 0.02, 0.12), src: 'PROXY 4 TITIK (KASAR)', vr6: null, vr24: null };
 }
 
 // ---------- aturan grid custom ----------
@@ -225,7 +265,6 @@ function fitHMM(r, iters = 60) {
       const z = (r[t] - mu[k]) / sg[k];
       B[t * K + k] = Math.exp(-0.5 * z * z) / (sg[k] * 2.5066282746310002) + 1e-300;
     }
-    // forward (scaled)
     let s = 0;
     for (let k = 0; k < K; k++) { al[k] = pi[k] * B[k]; s += al[k]; }
     sc[0] = s; for (let k = 0; k < K; k++) al[k] /= s;
@@ -238,7 +277,6 @@ function fitHMM(r, iters = 60) {
       }
       sc[t] = s; for (let j = 0; j < K; j++) al[t * K + j] /= s;
     }
-    // backward
     for (let k = 0; k < K; k++) be[(T - 1) * K + k] = 1;
     for (let t = T - 2; t >= 0; t--) for (let i = 0; i < K; i++) {
       let v = 0;
@@ -247,7 +285,6 @@ function fitHMM(r, iters = 60) {
     }
     ll = 0; for (let t = 0; t < T; t++) ll += Math.log(sc[t]);
 
-    // M-step
     const gS = [0, 0, 0], gR = [0, 0, 0], xi = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
     for (let t = 0; t < T; t++) for (let k = 0; k < K; k++) {
       const g = al[t * K + k] * be[t * K + k];
@@ -278,20 +315,30 @@ function fitHMM(r, iters = 60) {
   return { mu, sg, A, alpha: [al[L], al[L + 1], al[L + 2]], ll };
 }
 
-function buildHMM(q, vol, kl) {
-  let muH, sgH, Ah, alpha, fitted = false, nObs = 0;
+function buildHMM(q, vol, kl, days) {
+  let muH, sgH, Ah, alpha, fitted = false, nObs = 0, volScale = 1;
   const r = kl ? logReturns(kl) : null;
 
   if (r && r.length >= 200) {
     const f = fitHMM(r);
     const ord = [0, 1, 2].sort((a, b) => f.mu[b] - f.mu[a]);   // BULL, SIDE, BEAR
     sgH = ord.map((k) => f.sg[k]);
-    muH = ord.map((k, i) => clamp(f.mu[k] * DRIFT_SHRINK, -0.1 * sgH[i], 0.1 * sgH[i]));
     Ah = ord.map((i) => ord.map((j) => f.A[i][j]));
     alpha = ord.map((k) => f.alpha[k]);
+
+    // kalibrasi level σ: rata-rata varians HMM sepanjang horizon (posterior dipropagasi)
+    // disamakan dengan estimator OHLC; dibatasi 0.8–1.25 agar info regime tidak hilang
+    const steps = Math.max(24, Math.round((days || 7) * 24));
+    let pi = alpha.slice(), acc = 0;
+    for (let t = 0; t < steps; t++) {
+      acc += pi[0] * sgH[0] * sgH[0] + pi[1] * sgH[1] * sgH[1] + pi[2] * sgH[2] * sgH[2];
+      pi = [0, 1, 2].map((j) => pi[0] * Ah[0][j] + pi[1] * Ah[1][j] + pi[2] * Ah[2][j]);
+    }
+    volScale = clamp(Math.sqrt((vol * vol / 24) / (acc / steps)), 0.8, 1.25);
+    sgH = sgH.map((s) => s * volScale);
+    muH = ord.map((k, i) => clamp(f.mu[k] * DRIFT_SHRINK, -0.1 * sgH[i], 0.1 * sgH[i]));
     fitted = true; nObs = r.length;
   } else {
-    // fallback heuristik (tanpa candle): drift dikecilkan dari ±0.9σ ke ±0.3σ
     const muD = [0.3 * vol, 0, -0.3 * vol];
     const sgD = [1.0 * vol, 0.75 * vol, 1.3 * vol];
     const A = [[0.88, 0.10, 0.02], [0.08, 0.84, 0.08], [0.02, 0.10, 0.88]];
@@ -307,8 +354,8 @@ function buildHMM(q, vol, kl) {
       let M = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
       const w = Math.floor(L);
       for (let i = 0; i < w; i++) M = matMul(M, A);
-      const f = L - w;
-      if (f > 1e-9) M = matMul(M, A.map((row, i) => row.map((v, j) => (i === j ? 1 + f * (v - 1) : f * v))));
+      const fr = L - w;
+      if (fr > 1e-9) M = matMul(M, A.map((row, i) => row.map((v, j) => (i === j ? 1 + fr * (v - 1) : fr * v))));
       return M;
     };
     const emis = (x, L, k) => {
@@ -332,7 +379,7 @@ function buildHMM(q, vol, kl) {
   const piCum = [alpha[0], alpha[0] + alpha[1], 1];
   const muExpD = 24 * (alpha[0] * muH[0] + alpha[1] * muH[1] + alpha[2] * muH[2]);
   return {
-    fitted, nObs, muH, sgH, Ah, AhCum, piCum, alpha,
+    fitted, nObs, volScale, muH, sgH, Ah, AhCum, piCum, alpha,
     muEff: clamp(muExpD, -0.2 * vol, 0.2 * vol),
     sgD: sgH.map((s) => s * Math.sqrt(24)), muD: muH.map((m) => m * 24),
   };
@@ -344,51 +391,53 @@ function modelParams(R, H) {
 }
 const pickCum = (cum, u) => (u < cum[0] ? 0 : u < cum[1] ? 1 : 2);
 
-// ---------- buku order grid (dipakai simulasi & scan likuidasi) ----------
+// ---------- buku order grid (state order ala Pionex, dengan histeresis) ----------
+// Garis k = low + k·step. Order beli menunggu di garis nb, order jual di garis ns.
+// Sell terisi di k → nb = k−1, ns = k+1. Buy terisi di k → ns = k+1, nb = k−1.
 class GridBook {
   constructor(R) {
     this.R = R; this.cap = (R.invest * R.lev) / R.grids;
+    this.mode = !R.fut || R.dir === 'long' ? 0 : R.dir === 'short' ? 1 : 2;   // 0 long/spot, 1 short, 2 neutral
     this.L = []; this.Sh = []; this.sIL = 0; this.sIS = 0;
-    this.realized = 0; this.level = 0; this.center = 0;
+    this.realized = 0; this.nb = 0; this.ns = 1; this.cycles = 0;
   }
-  lv(p) { const R = this.R; return Math.min(R.grids, Math.max(0, Math.floor((p - R.low) / R.step))); }
+  line(k) { return this.R.low + k * this.R.step; }
   reset(p) {
     const R = this.R;
-    this.L.length = 0; this.Sh.length = 0; this.sIL = 0; this.sIS = 0; this.realized = 0;
-    const lvl = this.lv(p); this.level = lvl; this.center = lvl;
-    if (!R.fut || R.dir === 'long') { for (let k = 0; k < R.grids - lvl; k++) this.openL(p); }
-    else if (R.dir === 'short') { for (let k = 0; k < lvl; k++) this.openS(p); }
+    this.L.length = 0; this.Sh.length = 0; this.sIL = 0; this.sIS = 0; this.realized = 0; this.cycles = 0;
+    const lvl = Math.min(R.grids, Math.max(0, Math.floor((p - R.low) / R.step)));
+    this.nb = lvl; this.ns = lvl + 1;
+    if (this.mode === 0) { for (let k = 0; k < R.grids - lvl; k++) this.openL(p); }
+    else if (this.mode === 1) { for (let k = 0; k < lvl; k++) this.openS(p); }
   }
   openL(e) { this.L.push(e); this.sIL += 1 / e; }
   openS(e) { this.Sh.push(e); this.sIS += 1 / e; }
   closeL(px) {
     const e = this.L.pop(); this.sIL = this.L.length ? this.sIL - 1 / e : 0;
-    this.realized += this.cap * ((px - e) / e - 2 * this.R.fee);
+    this.realized += this.cap * ((px - e) / e - 2 * this.R.fee); this.cycles++;
   }
   closeS(px) {
     const e = this.Sh.pop(); this.sIS = this.Sh.length ? this.sIS - 1 / e : 0;
-    this.realized += this.cap * ((e - px) / e - 2 * this.R.fee);
+    this.realized += this.cap * ((e - px) / e - 2 * this.R.fee); this.cycles++;
+  }
+  fillSell(px) {
+    if (this.mode === 1) this.openS(px);
+    else if (this.L.length) this.closeL(px);
+    else if (this.mode === 2) this.openS(px);
+  }
+  fillBuy(px) {
+    if (this.mode === 0) this.openL(px);
+    else if (this.Sh.length) this.closeS(px);
+    else if (this.mode === 2) this.openL(px);
   }
   move(p) {
-    const R = this.R, nl = this.lv(p), level = this.level;
-    if (nl === level) return;
-    const neu = R.fut && R.dir === 'neutral', sh = R.dir === 'short';
-    if (nl > level) {
-      for (let L = level + 1; L <= nl; L++) {
-        const px = R.low + L * R.step;
-        if (neu) { if (L > this.center) this.openS(px); else if (this.L.length) this.closeL(px); }
-        else if (!sh) { if (this.L.length) this.closeL(px); }
-        else this.openS(px);
-      }
-    } else {
-      for (let L = level; L > nl; L--) {
-        const px = R.low + (L - 1) * R.step;
-        if (neu) { if (L - 1 < this.center) this.openL(px); else if (this.Sh.length) this.closeS(px); }
-        else if (!sh) this.openL(px);
-        else if (this.Sh.length) this.closeS(px);
-      }
+    const g = this.R.grids;
+    while (this.ns <= g && p >= this.line(this.ns)) {
+      this.fillSell(this.line(this.ns)); this.nb = this.ns - 1; this.ns++;
     }
-    this.level = nl;
+    while (this.nb >= 0 && p <= this.line(this.nb)) {
+      this.fillBuy(this.line(this.nb)); this.ns = this.nb + 1; this.nb--;
+    }
   }
   fl(p) { return this.cap * (p * this.sIL - this.L.length) + this.cap * (this.Sh.length - p * this.sIS); }
   notional(p) { return this.cap * p * (this.sIL + this.sIS); }
@@ -414,7 +463,7 @@ function liqScan(R, dirSign) {
 // ---------- mesin rekomendasi ----------
 function buildReco(q, T, H, vol) {
   const P = q.price;
-  const days = clamp(Math.round(+$('inDays').value || 7), 1, 30);
+  const days = readDays();
   const fee = Math.max(0, +$('inFee').value || 0.05) / 100;
   const invest = Math.max(10, +$('inInvest').value || 50);
   const fut = S.prod === 'fut';
@@ -476,6 +525,21 @@ function buildReco(q, T, H, vol) {
   return R;
 }
 
+// ---------- estimasi analitik waktu-ke-target (cek silang MC) ----------
+// Setelah fill di garis k, harga berada tepat di k dan order terdekat di k±1.
+// Waktu keluar Brownian dari (−δ, +δ): ODE ½σ²u'' = −1, u(±δ) = 0 → E[τ] = δ²/σ².
+// Kira-kira separuh fill menutup posisi (= 1 siklus profit), jadi waktu per siklus ≈ 2δ²/σ².
+// HANYA grid profit — floating PnL, fat tail & regime diabaikan.
+function etaAnalytic(R, sgHourly) {
+  const delta = Math.log(1 + R.step / R.P);
+  const tau = (delta * delta) / (sgHourly * sgHourly);          // jam per fill
+  const cap = (R.invest * R.lev) / R.grids;
+  const perCycle = cap * R.profitPerGridNet;
+  if (!(perCycle > 0) || !(tau > 0)) return null;
+  const cycles = Math.ceil(R.targetUsd / perCycle);
+  return { tauMin: tau * 60, cycles, perCycle, minutes: 2 * cycles * tau * 60 };
+}
+
 // ---------- RNG (bisa di-seed) ----------
 let _rand = Math.random;
 let gaussSpare = null;
@@ -485,9 +549,9 @@ function setSeed(seedStr) {
   if (!s) { _rand = Math.random; return; }
   let a = 0;
   for (let i = 0; i < s.length; i++) a = (Math.imul(a, 31) + s.charCodeAt(i)) | 0;
-  a = a >>> 0;
+  a |= 0;                                  // tetap int32 → tidak deopt di V8
   _rand = function mulberry32() {
-    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    a = (a + 0x6D2B79F5) | 0;
     let t = Math.imul(a ^ (a >>> 15), 1 | a);
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
@@ -509,22 +573,33 @@ function shock() {                         // fat tail, varians = 1
 const quantile = (sortedArr, p) =>
   sortedArr.length ? sortedArr[Math.min(sortedArr.length - 1, Math.floor(p * sortedArr.length))] : null;
 
+// high/low Brownian bridge di dalam satu langkah (log harga x0 → x1, varians v)
+// M = (x0+x1+√((x1−x0)² − 2v·ln U))/2   ;   m = (x0+x1−√(…))/2
+const bridgeHi = (x0, x1, v2) => 0.5 * (x0 + x1 + Math.sqrt((x1 - x0) * (x1 - x0) - v2 * Math.log(1 - _rand())));
+const bridgeLo = (x0, x1, v2) => 0.5 * (x0 + x1 - Math.sqrt((x1 - x0) * (x1 - x0) - v2 * Math.log(1 - _rand())));
+
 // ---------- Monte Carlo utama ----------
 function simulate(R, H) {
   setSeed(seedVal());
   const M = modelParams(R, H);
-  const SUB = subFor(R.days);
-  const nH = Math.round(R.days * 24), n = nH * SUB;
-  const sgSub = M.sgH.map((s) => s / Math.sqrt(SUB));
-  const drSub = M.muH.map((m, k) => m / SUB - 0.5 * sgSub[k] * sgSub[k]);
+  const SUB = subFor(R.days), SF = Math.max(SUB_FINE, SUB);
+  const nH = Math.round(R.days * 24);
+  const off = new Int32Array(nH + 1);
+  for (let h = 0; h < nH; h++) off[h + 1] = off[h] + (h < FINE_HOURS ? SF : SUB);
+  const n = off[nH];
+  const mk = (Sx) => {
+    const sg = M.sgH.map((s) => s / Math.sqrt(Sx));
+    return { sg, dr: M.muH.map((m, k) => m / Sx - 0.5 * sg[k] * sg[k]) };
+  };
+  const PF = mk(SF), PB = mk(SUB);
   const fundH = R.fut ? R.funding / 8 : 0;
   const slLow = R.slLow ?? -Infinity, slHigh = R.slHigh ?? Infinity;
   const tpLow = R.tpLow ?? -Infinity, tpHigh = R.tpHigh ?? Infinity;
   const book = new GridBook(R);
 
   const pnl = new Float64Array(N_SIM), endPx = new Float64Array(N_SIM);
-  const maxDD = new Float64Array(N_SIM), sharpe = new Float64Array(N_SIM);
-  const hitH = [];
+  const maxDD = new Float64Array(N_SIM), sharpe = new Float64Array(N_SIM), cyc = new Float64Array(N_SIM);
+  const hitMin = [];
   let liqCount = 0, slCount = 0, tpCount = 0;
   const samplePaths = [], sampleEq = [];
 
@@ -540,6 +615,27 @@ function simulate(R, H) {
 
   const gBuf = new Float64Array(n), rgBuf = new Int8Array(nH);
 
+  let fund = 0, exitPx = 0;
+  const liqAt = (q) => R.fut && R.invest + book.realized + book.fl(q) + fund <= MMR * book.notional(q);
+  // 0 = lanjut, 1 = likuidasi, 2 = SL, 3 = TP
+  const visit = (q) => {
+    if (q <= slLow) {
+      book.move(slLow); exitPx = slLow;
+      if (liqAt(slLow)) return 1;
+      book.closeAll(slLow * (1 - SLIP)); return 2;
+    }
+    if (q >= slHigh) {
+      book.move(slHigh); exitPx = slHigh;
+      if (liqAt(slHigh)) return 1;
+      book.closeAll(slHigh * (1 + SLIP)); return 2;
+    }
+    if (q >= tpHigh) { book.move(tpHigh); book.closeAll(tpHigh); exitPx = tpHigh; return 3; }
+    if (q <= tpLow) { book.move(tpLow); book.closeAll(tpLow); exitPx = tpLow; return 3; }
+    book.move(q);
+    if (liqAt(q)) { exitPx = q; return 1; }
+    return 0;
+  };
+
   for (let i = 0; i < N_SIM; i++) {
     const anti = (i & 1) === 1;
     if (!anti) {                                   // pre-generate → pasangan antithetic selalu lengkap
@@ -548,31 +644,37 @@ function simulate(R, H) {
       for (let t = 0; t < n; t++) gBuf[t] = shock();
     }
     const sgn = anti ? -1 : 1;
-    let p = R.P;
-    book.reset(p);
+    let p = R.P, lx = Math.log(R.P);
+    book.reset(p); fund = 0;
 
-    let fund = 0, eq = 0, peak = 0, minDd = 0, prevDayEq = 0, sumR = 0, sumR2 = 0, nD = 0;
-    let status = 0, hit = -1, hEnd = nH;
+    let eq = 0, peak = 0, minDd = 0, prevDayEq = 0, sumR = 0, sumR2 = 0, nD = 0;
+    let status = 0, hit = -1, tEnd = nH * 60;
     const kp = i < 60 ? [p] : null, ke = i < 60 ? [0] : null;
 
     outer:
     for (let h = 0; h < nH; h++) {
-      const rg = rgBuf[h], s = sgSub[rg], d = drSub[rg], base = h * SUB;
-      for (let j = 0; j < SUB; j++) {
-        p *= Math.exp(d + s * sgn * gBuf[base + j]);
-        if (p <= slLow || p >= slHigh) { book.closeAll(p); status = 2; hEnd = h + 1; break outer; }
-        if (p >= tpHigh || p <= tpLow) { book.closeAll(p); status = 3; hEnd = h + 1; break outer; }
-        book.move(p);
-        if (R.fut && R.invest + book.realized + book.fl(p) + fund <= MMR * book.notional(p)) {
-          status = 1; hEnd = h + 1; break outer;
+      const rg = rgBuf[h], fine = h < FINE_HOURS;
+      const Sx = fine ? SF : SUB, Pm = fine ? PF : PB;
+      const s = Pm.sg[rg], d = Pm.dr[rg], v2 = 2 * s * s, base = off[h];
+      for (let j = 0; j < Sx; j++) {
+        const x1 = lx + d + s * sgn * gBuf[base + j];
+        const up = x1 >= lx;
+        const hi = bridgeHi(lx, x1, v2), lo = bridgeLo(lx, x1, v2);
+        const tMin = (h + (j + 1) / Sx) * 60;
+        for (let w = 0; w < 3; w++) {
+          const q = Math.exp(w === 2 ? x1 : (w === 0) === up ? lo : hi);   // naik: O→L→H→C, turun: O→H→L→C
+          const st = visit(q);
+          if (st) { status = st; tEnd = tMin; p = exitPx; break outer; }
+          if (hit < 0 && book.realized + book.fl(q) + fund - R.fee * book.notional(q) >= R.targetUsd) hit = tMin;
         }
+        lx = x1;
       }
+      p = Math.exp(lx);
       if (fundH) fund += fundH * book.cap * p * (book.sIS - book.sIL);   // long bayar, short terima (funding +)
 
       eq = Math.max(-R.invest, book.realized + book.fl(p) + fund);
       if (eq > peak) peak = eq;
       if (eq - peak < minDd) minDd = eq - peak;
-      if (hit < 0 && eq >= R.targetUsd) hit = h + 1;
       if ((h + 1) % 24 === 0) {
         const rD = (eq - prevDayEq) / R.invest;
         sumR += rD; sumR2 += rD * rD; nD++; prevDayEq = eq;
@@ -587,15 +689,16 @@ function simulate(R, H) {
     if (status) {
       if (eq > peak) peak = eq;
       if (eq - peak < minDd) minDd = eq - peak;
-      if (hit < 0 && eq >= R.targetUsd) hit = hEnd;
+      if (hit < 0 && eq >= R.targetUsd) hit = tEnd;
       if (kp) { kp.push(p); ke.push(eq / R.invest * 100); }
     }
     for (let c = 0; c < ckIdx.length; c++) {
       if (!ckFilled[c][i]) { ckPx[c][i] = p; ckEq[c][i] = eq / R.invest * 100; }
+      ckFilled[c][i] = 0;
     }
-    if (hit > 0) hitH.push(hit);
+    if (hit > 0) hitMin.push(hit);
 
-    pnl[i] = eq; endPx[i] = p;
+    pnl[i] = eq; endPx[i] = p; cyc[i] = book.cycles;
     maxDD[i] = (minDd / R.invest) * 100;
     if (nD >= 2) {
       const m = sumR / nD, sd = Math.sqrt(Math.max(0, sumR2 / nD - m * m));
@@ -608,10 +711,11 @@ function simulate(R, H) {
   const px = Array.from(endPx).sort((a, b) => a - b);
   const ddArr = Array.from(maxDD).sort((a, b) => a - b);
   const shArr = Array.from(sharpe).sort((a, b) => a - b);
+  const cyArr = Array.from(cyc).sort((a, b) => a - b);
   const prob = (f) => pct.filter(f).length / pct.length;
   const targetPct = R.targetRate * 100;
   const mean = pct.reduce((a, b) => a + b, 0) / pct.length;
-  hitH.sort((a, b) => a - b);
+  hitMin.sort((a, b) => a - b);
 
   const fanOf = (arrs) => ckIdx.map((t, c) => {
     const arr = Array.from(arrs[c]).sort((a, b) => a - b);
@@ -619,21 +723,39 @@ function simulate(R, H) {
   });
 
   const pTarget = prob((x) => x >= targetPct - 1e-9);
-  const pTouch = hitH.length / N_SIM;
+  const pTouch = hitMin.length / N_SIM;
   const seOf = (p) => Math.sqrt(Math.max(1e-9, p * (1 - p) / N_SIM)) * 100;
 
+  // ---- distribusi waktu ke target ----
+  const horizonMin = nH * 60;
+  const cdfAt = (t) => {                                  // # hit ≤ t (binary search)
+    let a = 0, b = hitMin.length;
+    while (a < b) { const m = (a + b) >> 1; if (hitMin[m] <= t) a = m + 1; else b = m; }
+    return a / N_SIM;
+  };
+  const uq = (p) => { const k = Math.ceil(p * N_SIM) - 1; return k < hitMin.length ? hitMin[Math.max(0, k)] : null; };
+  const bucketMins = [15, 30, 60, 180, 360, 720, 1440, 4320, 10080, 20160].filter((t) => t < horizonMin).concat([horizonMin]);
+  const ttt = {
+    hitMin, horizonMin,
+    buckets: bucketMins.map((t) => ({ t, p: cdfAt(t) })),
+    t25: uq(0.25), t50: uq(0.5), t80: uq(0.8),
+    condMed: hitMin.length ? quantile(hitMin, 0.5) : null,
+    resFine: 60 / SF, resLate: 60 / SUB,
+    eta: etaAnalytic(R, Math.sqrt(M.sgH.reduce((a, s) => a + s * s, 0) / M.sgH.length)),
+  };
+
   return {
-    pct, samplePaths, sampleEq, mean, targetPct, nH, SUB,
+    pct, samplePaths, sampleEq, mean, targetPct, nH, SUB, SF, ttt,
     fan: fanOf(ckPx), eqFan: fanOf(ckEq),
     ddArr, shArr,
     median: quantile(pct, 0.5), p5: quantile(pct, 0.05), p95: quantile(pct, 0.95),
     ddP5: quantile(ddArr, 0.05), ddP50: quantile(ddArr, 0.5), ddP95: quantile(ddArr, 0.95),
     shP5: quantile(shArr, 0.05), shP50: quantile(shArr, 0.5), shP95: quantile(shArr, 0.95),
+    cyP5: quantile(cyArr, 0.05), cyP50: quantile(cyArr, 0.5), cyP95: quantile(cyArr, 0.95),
     pxP5: quantile(px, 0.05), pxP50: quantile(px, 0.5), pxP95: quantile(px, 0.95),
     pWin: prob((x) => x > 0),
     pTarget, se: seOf(pTarget),
     pTouch, seTouch: seOf(pTouch),
-    touchMedH: hitH.length ? quantile(hitH, 0.5) : null,
     p1: prob((x) => x >= 1),
     pLiq: liqCount / N_SIM, pSL: slCount / N_SIM, pTP: tpCount / N_SIM,
   };
@@ -666,7 +788,6 @@ function readRepairCfg(q) {
   const Qs = nUnits * qty;
   const fl0 = dir === 'short' ? Qs * (avg - P0) : Qs * (P0 - avg);
   const offset = pnlNow - gridNow - fl0;               // funding historis & selisih akuntansi Pionex
-  // equity efektif dikalibrasi supaya liq model = liq yang tertera di Pionex
   const E0 = liq0 > 0
     ? (dir === 'short' ? Q0 * (liq0 - P0) + MMR * Q0 * liq0 : Q0 * (P0 - liq0) - MMR * Q0 * liq0)
     : invest + pnlNow;
@@ -689,52 +810,56 @@ function simRepairScenario(c, H, add) {
   const sgSub = H.sgH.map((s) => s / Math.sqrt(SUB));
   const drSub = H.muH.map((m, k) => m / SUB - 0.5 * sgSub[k] * sgSub[k]);
   const fundH = c.funding / 8;
-  const levelOf = (p) => Math.min(c.grids, Math.max(0, Math.floor((p - c.low) / step)));
-  const stack = new Float64Array(c.grids + c.nUnits + 4);
+  const line = (k) => c.low + k * step;
+  const stack = new Float64Array(Math.max(c.grids, c.nUnits) + 4);
 
   const recHours = [], endTotals = [];
   let liqN = 0;
 
   for (let i = 0; i < N_SIM_REPAIR; i++) {
-    let p = c.P0;
+    let p = c.P0, lx = Math.log(c.P0);
     let rg = pickCum(H.piCum, _rand());
     let n = c.nUnits, sumE = c.nUnits * c.avg;
     for (let k = 0; k < n; k++) stack[k] = c.avg;
-    let level = levelOf(p), gridCum = 0, fund = 0, fl = c.fl0, done = false;
+    const lvl = clamp(Math.floor((p - c.low) / step), 0, c.grids);
+    let nb = lvl, ns = lvl + 1, gridCum = 0, fund = 0, fl = c.fl0, liq = false, rec = false;
 
-    for (let h = 0; h < nH && !done; h++) {
+    path:
+    for (let h = 0; h < nH; h++) {
       rg = pickCum(H.AhCum[rg], _rand());
-      const s = sgSub[rg], d = drSub[rg];
+      const s = sgSub[rg], d = drSub[rg], v2 = 2 * s * s;
       for (let j = 0; j < SUB; j++) {
-        p *= Math.exp(d + s * shock());
-        const nl = levelOf(p);
-        if (nl > level) {
-          for (let L = level + 1; L <= nl; L++) {
-            const px = c.low + L * step;
+        const x1 = lx + d + s * shock();
+        const up = x1 >= lx;
+        const hi = bridgeHi(lx, x1, v2), lo = bridgeLo(lx, x1, v2);
+        for (let w = 0; w < 3; w++) {
+          const q = Math.exp(w === 2 ? x1 : (w === 0) === up ? lo : hi);
+          while (ns <= c.grids && q >= line(ns)) {            // sell terisi
+            const px = line(ns);
             if (short) { if (n < c.grids) { stack[n++] = px; sumE += px; } }
             else if (n) { const e = stack[--n]; sumE -= e; gridCum += c.qty * (px - e) - c.fee * c.qty * (px + e); }
+            nb = ns - 1; ns++;
           }
-          level = nl;
-        } else if (nl < level) {
-          for (let L = level; L > nl; L--) {
-            const px = c.low + (L - 1) * step;
+          while (nb >= 0 && q <= line(nb)) {                  // buy terisi
+            const px = line(nb);
             if (short) { if (n) { const e = stack[--n]; sumE -= e; gridCum += c.qty * (e - px) - c.fee * c.qty * (px + e); } }
             else if (n < c.grids) { stack[n++] = px; sumE += px; }
+            ns = nb + 1; nb--;
           }
-          level = nl;
+          if (!n) sumE = 0;
+          fl = short ? c.qty * (sumE - n * q) : c.qty * (n * q - sumE);
+          if (c.E0 + add + gridCum + fund + (fl - c.fl0) <= MMR * c.qty * n * q) { liq = true; break path; }
         }
-        if (!n) sumE = 0;
-        fl = short ? c.qty * (sumE - n * p) : c.qty * (n * p - sumE);
-        const equity = c.E0 + add + gridCum + fund + (fl - c.fl0);
-        if (equity <= MMR * c.qty * n * p) { liqN++; done = true; break; }
+        lx = x1;
       }
-      if (done) break;
+      p = Math.exp(lx);
+      fl = short ? c.qty * (sumE - n * p) : c.qty * (n * p - sumE);
       fund += (short ? 1 : -1) * fundH * c.qty * n * p;
-      const total = c.gridNow + gridCum + fund + fl + c.offset;
-      const net = total - c.fee * c.qty * n * p;            // fee menutup posisi saat exit
-      if (net >= target) { recHours.push(h + 1); done = true; }
+      const net = c.gridNow + gridCum + fund + fl + c.offset - c.fee * c.qty * n * p;   // fee penutupan saat exit
+      if (net >= target) { recHours.push(h + 1); rec = true; break; }
     }
-    if (!done) endTotals.push(c.gridNow + gridCum + fund + fl + c.offset - c.fee * c.qty * n * p);
+    if (liq) liqN++;
+    else if (!rec) endTotals.push(c.gridNow + gridCum + fund + fl + c.offset - c.fee * c.qty * n * p);
   }
 
   recHours.sort((a, b) => a - b);
@@ -759,8 +884,8 @@ async function runRepair() {
   await new Promise((r) => setTimeout(r, 30));
 
   setSeed(seedVal());
-  const { vol } = dailyVol(q, kl);
-  const H = buildHMM(q, vol, kl);
+  const { vol } = dailyVol(q, kl, c.days);
+  const H = buildHMM(q, vol, kl, c.days);
 
   const adds = [...new Set([0, 0.25, 0.5, 1].map((f) => Math.round(c.avail * f)))];
   const rows = adds.map((a) => simRepairScenario(c, H, a));
@@ -822,11 +947,12 @@ function renderRepair(c, rows, rec, q, H) {
   h += `<div class="bd" style="font-size:12px">${verdict}</div>
   <div class="bd" style="padding-top:0; font-size:11px; color:var(--muted)">
     Asumsi model: (1) exit saat Total Profit dikurangi fee penutupan ≥ target (dicek tiap jam);
-    (2) likuidasi dinamis: equity terkalibrasi dari liq Pionex, dicek tiap 15 menit termasuk posisi baru yang dibuka grid;
-    "Liq awal" = liq untuk posisi saat ini saja;
-    (3) funding ${(c.funding * 100).toFixed(3)}%/8 jam konstan (positif = short menerima);
-    (4) grid di luar range tidak membuka posisi baru;
-    (5) volatilitas & regime ${H.fitted ? `HMM hasil fit ${H.nObs} candle 1 jam` : 'HMM heuristik (candle tidak tersedia)'}.
+    (2) likuidasi dinamis: equity terkalibrasi dari liq Pionex, dicek tiap 15 menit di open/high/low/close intrabar
+    (Brownian bridge), termasuk posisi baru yang dibuka grid; "Liq awal" = liq untuk posisi saat ini saja;
+    (3) order grid dengan histeresis ala Pionex (fill di garis k → order baru di k±1);
+    (4) funding ${(c.funding * 100).toFixed(3)}%/8 jam konstan (positif = short menerima);
+    (5) grid di luar range tidak membuka posisi baru;
+    (6) volatilitas & regime ${H.fitted ? `HMM hasil fit ${H.nObs} candle 1 jam` : 'HMM heuristik (candle tidak tersedia)'}.
     ${N_SIM_REPAIR.toLocaleString()} path/skenario — estimasi, bukan jaminan.
   </div>`;
   $('repairBody').innerHTML = h;
@@ -838,6 +964,17 @@ function renderRepair(c, rows, rec, q, H) {
 const fmt = (x, d = 4) => x == null || !isFinite(x) ? '—' : Number(x).toLocaleString('en-US', { maximumFractionDigits: d, minimumFractionDigits: Math.min(d, 2) });
 const pctCls = (x) => (x >= 0 ? 'up' : 'dn');
 const pctTxt = (x) => (x == null ? '—' : (x >= 0 ? '+' : '') + x.toFixed(2) + '%');
+const fmtDur = (m) => {
+  if (m == null || !isFinite(m)) return '—';
+  if (m < 60) return Math.max(1, Math.round(m)) + ' menit';
+  if (m < 48 * 60) {
+    const h = Math.floor(m / 60), mm = Math.round((m - h * 60) / 5) * 5;
+    if (mm >= 60) return (h + 1) + ' jam';
+    return mm ? `${h} jam ${mm} menit` : `${h} jam`;
+  }
+  return (m / 1440).toFixed(1) + ' hari';
+};
+const fmtDurS = (m) => (m < 60 ? m + 'm' : m < 1440 ? (m / 60) + 'j' : (m / 1440) + 'h');
 
 function renderMarket(q, vol, volSrc) {
   $('mktPrice').innerHTML = '$' + fmt(q.price) + ' <small>' + S.coin + '/USDT · ' +
@@ -852,7 +989,24 @@ function renderMarket(q, vol, volSrc) {
   b.textContent = q.demo ? '● DEMO' : '● LIVE';
 }
 
-function renderTrend(T, H, R, sim) {
+function vrText(V) {
+  if (!V || !V.vr6) return 'Variance ratio: butuh candle 1 jam (tidak tersedia).';
+  const one = (o) => {
+    if (!o) return '';
+    const z = (o.vr - 1) / o.se;
+    const tag = z <= -2 ? 'mean-reverting (signifikan)' : z >= 2 ? 'trending (signifikan)' : 'mendekati random walk';
+    return `VR(${o.q}j) ${o.vr.toFixed(2)} ±${o.se.toFixed(2)} → ${tag}`;
+  };
+  const z6 = (V.vr6.vr - 1) / V.vr6.se;
+  const imp = z6 <= -2
+    ? 'Harga cenderung balik arah dalam hitungan jam — grid nyata kemungkinan mendapat LEBIH banyak siklus daripada simulasi (hasil model konservatif).'
+    : z6 >= 2
+      ? 'Harga cenderung melanjutkan arah — simulasi random-walk kemungkinan TERLALU OPTIMIS untuk grid; perlakukan confidence sebagai batas atas.'
+      : 'Tidak ada bukti kuat mean-reversion/trend intraday — asumsi random walk model wajar.';
+  return `${one(V.vr6)} · ${one(V.vr24)}. ${imp}`;
+}
+
+function renderTrend(T, H, R, sim, V) {
   const lb = $('trLabel');
   lb.textContent = T.label;
   lb.className = 'v ' + T.cls;
@@ -869,8 +1023,9 @@ function renderTrend(T, H, R, sim) {
   $('hmmNote').textContent = !R.useHMM
     ? 'Mode GBM klasik aktif — posterior regime hanya referensi, simulasi memakai drift regresi trend (sudah di-shrink).'
     : H.fitted
-      ? `HMM di-fit (Baum-Welch) pada ${H.nObs} return 1 jam. Regime dominan: ${names[dom]} (${(H.alpha[dom] * 100).toFixed(0)}%). ${regTxt}. Drift di-shrink 75% karena estimasi drift jangka pendek sangat noisy.`
+      ? `HMM di-fit (Baum-Welch) pada ${H.nObs} return 1 jam. Regime dominan: ${names[dom]} (${(H.alpha[dom] * 100).toFixed(0)}%). ${regTxt}. Level σ dikalibrasi ×${H.volScale.toFixed(2)} ke estimator OHLC; drift di-shrink 75%.`
       : `Candle 1 jam tidak tersedia → HMM heuristik dari 4 titik CMC (kurang andal). Regime dominan: ${names[dom]} (${(H.alpha[dom] * 100).toFixed(0)}%).`;
+  if ($('vrNote')) $('vrNote').textContent = vrText(V);
 
   $('trPred').innerHTML =
     `Prediksi H+${R.days} (${R.useHMM ? 'HMM regime-switching' : 'GBM'}, ${N_SIM.toLocaleString()} simulasi): ` +
@@ -933,8 +1088,9 @@ function renderReco(R, sim) {
   }
   h += frow('Confidence', `% path dgn PnL ≥ ${fmt(R.targetUsd, 2)} USDT di akhir H+${R.days}`,
     conf.toFixed(1) + '% ± ' + sim.se.toFixed(1) + '%');
-  h += frow('P(target tersentuh)', 'kapan saja ≤ horizon — kalau bot ditutup saat target',
-    (sim.pTouch * 100).toFixed(1) + '%' + (sim.touchMedH ? ` · median ${(sim.touchMedH / 24).toFixed(1)} hari` : ''));
+  const T = sim.ttt;
+  h += frow('Waktu capai target', 'kalau bot ditutup begitu target tersentuh (bersih fee)',
+    (sim.pTouch * 100).toFixed(1) + '%' + (T.t50 != null ? ` · 50% dlm ≤ ${fmtDur(T.t50)}` : T.condMed ? ` · median sukses ${fmtDur(T.condMed)}` : ''));
   $('recoBody').innerHTML = h;
 
   $('recoBody').querySelectorAll('.cp').forEach((b) =>
@@ -942,6 +1098,48 @@ function renderReco(R, sim) {
       navigator.clipboard.writeText(b.dataset.cp.replace(/,/g, ''));
       b.textContent = '✓'; setTimeout(() => (b.textContent = 'salin'), 900);
     }));
+}
+
+function renderTTT(R, sim) {
+  const T = sim.ttt, tUsd = fmt(R.targetUsd, 2);
+  let head;
+  if (T.t50 != null) {
+    head = `<b>50%</b> path mencapai +${tUsd} USDT dalam ≤ <b>${fmtDur(T.t50)}</b>` +
+      (T.t80 != null ? `; 80% dalam ≤ <b>${fmtDur(T.t80)}</b>` : `; 80% tidak tercapai dalam ${R.days} hari`) +
+      `. 25% tercepat: ≤ ${fmtDur(T.t25)}.`;
+  } else if (T.hitMin.length) {
+    head = `Kurang dari separuh path mencapai +${tUsd} USDT dalam ${R.days} hari (P = ${(sim.pTouch * 100).toFixed(1)}%). ` +
+      `Dari path yang berhasil, median waktunya ${fmtDur(T.condMed)} — tapi jangan diartikan "pasti tercapai dalam waktu itu".`;
+  } else {
+    head = `Tidak ada path yang mencapai +${tUsd} USDT dalam ${R.days} hari.`;
+  }
+
+  let tbl = '<div style="overflow-x:auto"><table class="rpt"><tr><th>Dalam ≤</th>';
+  T.buckets.forEach((b) => { tbl += `<th>${fmtDur(b.t)}</th>`; });
+  tbl += '</tr><tr><td>P(tercapai)</td>';
+  T.buckets.forEach((b) => { tbl += `<td class="${b.p >= 0.5 ? 'up' : ''}">${(b.p * 100).toFixed(1)}%</td>`; });
+  tbl += '</tr></table></div>';
+
+  const e = T.eta;
+  const etaTxt = e
+    ? `Cek silang analitik (ODE first-exit, hanya grid profit): 1 fill ≈ ${fmtDur(e.tauMin)}, 1 siklus profit ≈ ${fmt(e.perCycle, 4)} USDT,
+       butuh ${e.cycles} siklus → ≈ <b>${fmtDur(e.minutes)}</b>.
+       ${T.t50 != null && T.t50 < 0.5 * e.minutes ? 'MC jauh lebih cepat → target banyak dicapai lewat floating profit (arah harga), bukan siklus grid — lebih bergantung keberuntungan arah.' : ''}
+       ${T.t50 != null && T.t50 > 2 * e.minutes ? 'MC jauh lebih lambat → floating loss/fee/SL sering menahan total profit di bawah target walau grid berputar.' : ''}`
+    : 'Cek silang analitik tidak tersedia (profit/grid ≤ 0).';
+
+  $('tttBody').innerHTML = `<div class="bd" style="font-size:12px">${head}</div>
+    <div class="bd" style="padding-top:0">${tbl}</div>
+    <div class="bd" style="padding-top:0; font-size:11.5px">${etaTxt}</div>
+    <div class="bd" style="padding-top:0; font-size:11px; color:var(--muted)">
+      Waktu = saat PERTAMA KALI Total Profit dikurangi fee penutupan ≥ target (cek di open/high/low/close tiap langkah).
+      Resolusi ${T.resFine} menit untuk 24 jam pertama, lalu ${T.resLate} menit. Persentase dihitung terhadap SEMUA ${N_SIM.toLocaleString()} path
+      (path yang tidak pernah mencapai target ikut dihitung sebagai "belum"). Angka &lt; 1 jam paling sensitif terhadap spread, wick & latensi bot
+      yang tidak dimodelkan penuh — perlakukan sebagai urutan besaran.
+    </div>`;
+  $('tttBadge').textContent = T.t50 != null ? `50% ≤ ${fmtDur(T.t50)}` : `P ${(sim.pTouch * 100).toFixed(0)}%`;
+  $('tttBadge').className = 'badge ' + (T.t50 != null ? 'live' : 'demo');
+  drawTTT(R, sim);
 }
 
 function renderStats(R, sim) {
@@ -952,13 +1150,13 @@ function renderStats(R, sim) {
   const exitTxt = (R.fut ? `${(sim.pLiq * 100).toFixed(1)}% / ` : '') + `${(sim.pSL * 100).toFixed(1)}% / ${(sim.pTP * 100).toFixed(1)}%`;
   $('simStats').innerHTML =
     cell(`P(≥ ${tUsd} USDT di akhir)`, (sim.pTarget * 100).toFixed(1) + '% ±' + sim.se.toFixed(1), sim.pTarget >= 0.55 ? 'up' : '', sim.pTarget * 100) +
-    cell(`P(sentuh ${tUsd} USDT)`, (sim.pTouch * 100).toFixed(1) + '%' + (sim.touchMedH ? ` · ${(sim.touchMedH / 24).toFixed(1)}h` : ''), sim.pTouch >= 0.55 ? 'up' : '', sim.pTouch * 100) +
+    cell(`P(sentuh ${tUsd} USDT)`, (sim.pTouch * 100).toFixed(1) + '%' + (sim.ttt.t50 != null ? ` · ${fmtDur(sim.ttt.t50)}` : ''), sim.pTouch >= 0.55 ? 'up' : '', sim.pTouch * 100) +
     cell('P(PnL > 0)', (sim.pWin * 100).toFixed(1) + '%', sim.pWin >= 0.5 ? 'up' : 'dn', sim.pWin * 100) +
     cell('Median PnL', pctTxt(sim.median) + ' (' + fmt(sim.median * R.invest / 100, 2) + ' USDT)', pctCls(sim.median)) +
     cell('Rata-rata / P5 / P95', pctTxt(sim.mean) + ' · ' + pctTxt(sim.p5) + ' / ' + pctTxt(sim.p95)) +
     cell(R.fut ? 'P(liq) / P(SL) / P(TP)' : 'P(SL) / P(TP)', exitTxt, (sim.pLiq + sim.pSL) > 0.2 ? 'dn' : '');
   $('simMeta').textContent =
-    `${R.useHMM ? 'HMM 3-REGIME' : 'GBM'} · ${N_SIM.toLocaleString()} PATH · STEP ${60 / sim.SUB} MENIT · ANTITHETIC · FAT-TAIL · ${R.days} HARI · σ ${(R.vol * 100).toFixed(2)}%/HARI`;
+    `${R.useHMM ? 'HMM 3-REGIME' : 'GBM'} · ${N_SIM.toLocaleString()} PATH · STEP ${60 / sim.SF}→${60 / sim.SUB} MENIT · BRIDGE INTRABAR · ANTITHETIC · FAT-TAIL · ${R.days} HARI · σ ${(R.vol * 100).toFixed(2)}%/HARI`;
 }
 
 function renderMcSummary(R, sim) {
@@ -970,6 +1168,7 @@ function renderMcSummary(R, sim) {
       ${row('Total Return', sim.p5, sim.median, sim.p95, pctTxt)}
       ${row('Max Drawdown', sim.ddP5, sim.ddP50, sim.ddP95, pctTxt)}
       ${row('Sharpe Ratio', sim.shP5, sim.shP50, sim.shP95, (x) => x.toFixed(2))}
+      ${row('Siklus grid (close)', sim.cyP5, sim.cyP50, sim.cyP95, (x) => x.toFixed(0))}
     </table>`;
 
   const usd = (p) => fmt(p * R.invest / 100, 2);
@@ -994,7 +1193,7 @@ function renderMcSummary(R, sim) {
      Di 5% skenario terburuk drawdown mencapai ${pctTxt(sim.ddP5)}.
      Sharpe median ${sim.shP50.toFixed(2)} = ${shTxt}. ${skew} ${riskTail}
      Target ${fmt(R.targetUsd, 2)} USDT: <b>${(sim.pTarget * 100).toFixed(1)}% ± ${sim.se.toFixed(1)}%</b> masih di atas target pada akhir horizon,
-     dan <b>${(sim.pTouch * 100).toFixed(1)}%</b> sempat menyentuhnya di tengah jalan — angka kedua relevan kalau Anda menutup bot begitu target tercapai.
+     dan <b>${(sim.pTouch * 100).toFixed(1)}%</b> sempat menyentuhnya di tengah jalan${sim.ttt.t50 != null ? ` (separuh path sudah menyentuh dalam ${fmtDur(sim.ttt.t50)})` : ''} — angka kedua relevan kalau Anda menutup bot begitu target tercapai.
      Angka ± adalah noise simulasi; dua run yang berbeda dalam rentang itu sama saja.`;
 }
 
@@ -1169,6 +1368,46 @@ function drawHist3(sim) {
   panel(2 * (pw + gap), sim.shArr, '#7A4FA3',      'SHARPE RATIO',   (v) => v.toFixed(2));
 }
 
+// kurva CDF waktu-ke-target, sumbu waktu logaritmik
+function drawTTT(R, sim) {
+  const cv = $('cvTTT'); if (!cv) return;
+  const ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  const W = cv.width, H = cv.height, padL = 44, padR = 16, padT = 14, padB = 26;
+  const T = sim.ttt, t0 = 5, t1 = Math.max(T.horizonMin, 10);
+  const X = (t) => padL + (Math.log(Math.max(t, t0) / t0) / Math.log(t1 / t0)) * (W - padL - padR);
+  const Y = (p) => padT + (1 - p) * (H - padT - padB);
+
+  ctx.font = '9px ui-monospace';
+  [0, 0.25, 0.5, 0.75, 1].forEach((p) => {
+    ctx.strokeStyle = css(p === 0.5 ? '--green' : '--line-soft'); ctx.setLineDash(p === 0.5 ? [3, 3] : []);
+    ctx.beginPath(); ctx.moveTo(padL, Y(p)); ctx.lineTo(W - padR, Y(p)); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = css('--muted'); ctx.fillText((p * 100).toFixed(0) + '%', 6, Y(p) + 3);
+  });
+  [15, 60, 180, 720, 1440, 4320, 10080, 43200].filter((t) => t <= t1).forEach((t) => {
+    ctx.strokeStyle = css('--line-soft');
+    ctx.beginPath(); ctx.moveTo(X(t), padT); ctx.lineTo(X(t), H - padB); ctx.stroke();
+    ctx.fillStyle = css('--muted'); ctx.fillText(fmtDurS(t), X(t) - 8, H - 10);
+  });
+
+  if (T.eta && T.eta.minutes <= t1) {
+    ctx.strokeStyle = css('--amber'); ctx.setLineDash([2, 3]);
+    ctx.beginPath(); ctx.moveTo(X(T.eta.minutes), padT); ctx.lineTo(X(T.eta.minutes), H - padB); ctx.stroke();
+    ctx.setLineDash([]); ctx.fillStyle = css('--amber');
+    ctx.fillText('analitik', X(T.eta.minutes) + 4, padT + 10);
+  }
+
+  ctx.strokeStyle = css('--ink'); ctx.lineWidth = 1.8;
+  ctx.beginPath(); ctx.moveTo(X(t0), Y(0));
+  let c = 0;
+  for (const t of T.hitMin) { ctx.lineTo(X(t), Y(c / N_SIM)); c++; ctx.lineTo(X(t), Y(c / N_SIM)); }
+  ctx.lineTo(X(t1), Y(c / N_SIM));
+  ctx.stroke(); ctx.lineWidth = 1;
+
+  ctx.fillStyle = css('--muted'); ctx.font = '10px ui-monospace';
+  ctx.fillText(`P(TARGET +${fmt(R.targetUsd, 2)} USDT TERCAPAI ≤ t) — SUMBU WAKTU LOG`, padL, padT - 3);
+}
+
 // ---------- main ----------
 $('btnGo').addEventListener('click', async () => {
   const btn = $('btnGo');
@@ -1178,14 +1417,16 @@ $('btnGo').addEventListener('click', async () => {
     btn.textContent = `MENJALANKAN ${N_SIM.toLocaleString()} SIMULASI (${S.model.toUpperCase()})…`;
     await new Promise((r) => setTimeout(r, 30));
 
-    const { vol, src } = dailyVol(q, kl);
-    const T = buildTrend(q, vol, kl);
-    const H = buildHMM(q, vol, kl);
-    const R = buildReco(q, T, H, vol);
-    renderMarket(q, vol, src);
+    const days = readDays();
+    const V = dailyVol(q, kl, days);
+    const T = buildTrend(q, V.vol, kl);
+    const H = buildHMM(q, V.vol, kl, days);
+    const R = buildReco(q, T, H, V.vol);
+    renderMarket(q, V.vol, V.src);
     const sim = simulate(R, H);
-    renderTrend(T, H, R, sim);
+    renderTrend(T, H, R, sim, V);
     renderReco(R, sim);
+    renderTTT(R, sim);
     renderStats(R, sim);
     drawPaths(R, sim);
     drawEquityFan(R, sim);
