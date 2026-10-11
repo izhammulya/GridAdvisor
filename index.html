@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>GRIDFISH v4 · Pionex Grid Advisor — LINK / SOL / ETH / INJ</title>
+<title>GRIDFISH v5 · Pionex Grid Advisor — LINK / SOL / ETH / INJ</title>
 <style>
   :root{
     --paper:#F6F5F0; --panel:#FFFFFF; --ink:#17181A; --muted:#8B887E;
@@ -37,7 +37,7 @@
   .card>.hd{display:flex; justify-content:space-between; align-items:center; gap:8px;
     padding:9px 14px; border-bottom:1px solid var(--line-soft)}
   .card>.hd .t{font-size:11px; letter-spacing:.12em; text-transform:uppercase; font-weight:600}
-  .card>.bd{padding:14px}
+  .card>.bd, .card .bd{padding:14px}
 
   .fld{margin-bottom:12px}
   .fld label{display:block; font-size:10px; letter-spacing:.12em; text-transform:uppercase; color:var(--muted); margin-bottom:5px}
@@ -73,6 +73,7 @@
   #trPred{padding:10px 14px; font-size:11px; border-top:1px solid var(--line-soft)}
   #trNote{padding:8px 14px 12px; font-size:11px; color:var(--muted)}
   #hmmNote{padding:8px 14px 4px; font-size:11px; color:var(--muted); border-top:1px solid var(--line-soft)}
+  #vrNote{padding:4px 14px 8px; font-size:11px; color:var(--muted)}
 
   .pnx .frow{display:flex; justify-content:space-between; align-items:center; gap:10px;
     padding:9px 14px; border-bottom:1px dashed var(--line-soft)}
@@ -111,8 +112,8 @@
     <div class="logo">
       <div class="dot">◦</div>
       <div>
-        <h1>GRIDFISH v4 · <b>PIONEX GRID ADVISOR</b></h1>
-        <span class="tag">LINK · SOL · ETH · INJ — GRID SPOT &amp; FUTURES · REPAIR BOT · MC STRESS TEST</span>
+        <h1>GRIDFISH v5 · <b>PIONEX GRID ADVISOR</b></h1>
+        <span class="tag">LINK · SOL · ETH · INJ — GRID SPOT &amp; FUTURES · WAKTU KE TARGET · REPAIR BOT · MC STRESS TEST</span>
       </div>
     </div>
     <div style="text-align:right">
@@ -186,7 +187,7 @@
             <input type="text" id="inSeed" placeholder="kosong = acak tiap run">
           </div>
           <button class="go" id="btnGo">Minta Rekomendasi</button>
-          <div class="note">Target profit otomatis: Grid Spot <b>0.30% investasi</b> (50 USDT → 0.15 USDT); Futures Grid <b>1 USDT per 100 USDT margin</b> (500 USDT → 5 USDT). Grid Spot memakai aturan <b>point ÷ pembagi + 1</b>. Volatilitas &amp; HMM dihitung dari 720 candle 1 jam Binance (fallback CMC) — diambil hanya saat tombol ditekan.</div>
+          <div class="note">Target profit otomatis: Grid Spot <b>0.30% investasi</b> (50 USDT → 0.15 USDT); Futures Grid <b>1 USDT per 100 USDT margin</b> (500 USDT → 5 USDT). Grid Spot memakai aturan <b>point ÷ pembagi + 1</b>. Volatilitas (Garman–Klass + close-to-close) &amp; HMM dihitung dari 720 candle 1 jam Binance (fallback CMC). Simulasi per 5 menit untuk 24 jam pertama + high/low intrabar, sehingga waktu capai target bisa dibaca dalam menit/jam.</div>
         </div>
       </div>
 
@@ -218,6 +219,7 @@
           <div><div class="k">P(BEAR)</div><div class="v">—</div></div>
         </div>
         <div id="hmmNote">Posterior regime HMM muncul setelah rekomendasi dijalankan.</div>
+        <div id="vrNote">Variance ratio (uji mean-reversion intraday) muncul setelah rekomendasi dijalankan.</div>
         <div id="trPred">—</div>
         <div id="trNote">Tekan "Minta Rekomendasi" untuk melihat trend &amp; prediksi.</div>
       </div>
@@ -279,6 +281,17 @@
 
       <div class="card" style="margin-top:12px">
         <div class="hd">
+          <span class="t">Waktu Capai Target</span>
+          <span class="badge" id="tttBadge">MENUNGGU</span>
+        </div>
+        <div id="tttBody">
+          <div class="bd" style="color:var(--muted)">Setelah rekomendasi dijalankan, kartu ini menunjukkan peluang target tercapai dalam ≤ 15 menit, 30 menit, 1 jam, 3 jam … sampai akhir horizon, plus waktu yang dibutuhkan 25% / 50% / 80% path.</div>
+        </div>
+        <div class="bd" style="padding-top:0"><canvas id="cvTTT" width="960" height="200"></canvas></div>
+      </div>
+
+      <div class="card" style="margin-top:12px">
+        <div class="hd">
           <span class="t">Repair Bot — Add Investment &amp; Waktu Recovery</span>
           <span class="badge" id="repairBadge">MENUNGGU</span>
         </div>
@@ -311,7 +324,7 @@
       </div>
 
       <div class="disc">
-        ⚠ <b>Bukan nasihat keuangan.</b> Simulasi Monte Carlo (HMM/GBM) adalah model probabilistik dari volatilitas &amp; regime historis — bukan prediksi. Confidence, waktu recovery, dan P(likuidasi) hanya seakurat asumsi modelnya. Menambah investasi ke bot yang rugi memperbesar eksposur; futures dengan leverage dapat terlikuidasi hingga kehilangan seluruh margin. Gunakan dana yang siap Anda hilangkan, dan verifikasi setiap angka sebelum menekan tombol apa pun di Pionex.
+        ⚠ <b>Bukan nasihat keuangan.</b> Simulasi Monte Carlo (HMM/GBM) adalah model probabilistik dari volatilitas &amp; regime historis — bukan prediksi. Confidence, waktu capai target, waktu recovery, dan P(likuidasi) hanya seakurat asumsi modelnya. Menambah investasi ke bot yang rugi memperbesar eksposur; futures dengan leverage dapat terlikuidasi hingga kehilangan seluruh margin. Gunakan dana yang siap Anda hilangkan, dan verifikasi setiap angka sebelum menekan tombol apa pun di Pionex.
       </div>
     </div>
   </div>
