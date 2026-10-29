@@ -26,7 +26,7 @@ export default async function handler(req, res) {
     const j = await r.json();
 
     if (j && j.data && j.data.tickers) {
-      // Pionex menggunakan underscore, contoh: LINK_USDT
+      // FIX PIONEX: Gunakan underscore, contoh: LINK_USDT
       const ticker = j.data.tickers.find(t => t.symbol === symbol + '_USDT');
       if (ticker) {
         const data = {
