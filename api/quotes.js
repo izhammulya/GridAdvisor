@@ -26,12 +26,13 @@ export default async function handler(req, res) {
     const j = await r.json();
 
     if (j && j.data && j.data.tickers) {
-      const ticker = j.data.tickers.find(t => t.symbol === symbol + 'USDT');
+      // Pionex menggunakan underscore, contoh: LINK_USDT
+      const ticker = j.data.tickers.find(t => t.symbol === symbol + '_USDT');
       if (ticker) {
         const data = {
           symbol,
           price: parseFloat(ticker.close),
-          change_24h: parseFloat(ticker.percentage) * 100, // Pionex menggunakan format desimal, misal 0.05 = 5%
+          change_24h: parseFloat(ticker.percentage) * 100, // Pionex desimal (0.05 = 5%)
           src: 'PIONEX',
           last_updated: new Date().toISOString()
         };
@@ -40,7 +41,7 @@ export default async function handler(req, res) {
         return res.status(200).json(data);
       }
     }
-    return res.status(502).json({ error: 'Koin tidak ditemukan di Pionex' });
+    return res.status(502).json({ error: 'Koin tidak ditemukan di API Pionex' });
   } catch (e) {
     return res.status(502).json({ error: 'Gagal menghubungi API Pionex: ' + e.message });
   }
