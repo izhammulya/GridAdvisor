@@ -1,3 +1,4 @@
+// app.js
 /* GRIDFISH v6 — Pionex Grid Advisor (LINK/SOL/ETH/INJ)
    ================================================================
    Model tetap aproksimasi — bukan jaminan. */
@@ -152,7 +153,7 @@ function fitGARCH(r) {
   let m = 0; for (const x of r) m += x; m /= T;
   const e = new Float64Array(T); let v = 0;
   for (let t = 0; t < T; t++) { e[t] = r[t] - m; v += e[t] * e[t]; } 
-  v /= T;
+  v /= T; 
   
   if (!(v > 0)) return null;
   let best = null;
@@ -1494,29 +1495,15 @@ function renderOptimizer(opt, cfg) {
 
 function renderTTT(R, sim) {
   const T = sim.ttt;
-  
   let tbl = '<div style="overflow-x:auto"><table class="rpt"><tr><th>Dalam ≤</th>';
   T.buckets.forEach((b) => { tbl += `<th>${fmtDur(b.t)}</th>`; });
   tbl += '</tr><tr><td>P(tercapai)</td>';
   T.buckets.forEach((b) => { tbl += `<td class="${b.p >= 0.5 ? 'up' : ''}">${(b.p * 100).toFixed(1)}%</td>`; });
   tbl += '</tr></table></div>';
 
-  let etaHtml = '';
-  if (T.eta) {
-    etaHtml = `<div style="margin-top:12px; font-size:13px; padding-top:8px; border-top:1px solid var(--border);">
-      Estimasi Waktu (Analitik): <b>~${fmtDur(T.eta.minutes)}</b> 
-      <span class="mut" style="font-size:11px;">(Butuh ≈ ${T.eta.cycles} siklus matching grid)</span>
-    </div>`;
-  } else {
-    etaHtml = `<div style="margin-top:12px; font-size:13px; padding-top:8px; border-top:1px solid var(--border); color:var(--red);">
-      Estimasi Waktu: Tidak dapat dikalkulasi (Profit per grid terlalu kecil atau volatilitas nol).
-    </div>`;
-  }
-
-  $('tttBody').innerHTML = `<div class="bd" style="padding-top:0">${tbl}${etaHtml}</div>`;
+  $('tttBody').innerHTML = `<div class="bd" style="padding-top:0">${tbl}</div>`;
   $('tttBadge').textContent = T.t50 != null ? `50% ≤ ${fmtDur(T.t50)}` : `P ${(sim.pTouch * 100).toFixed(0)}%`;
   $('tttBadge').className = 'badge ' + (T.t50 != null ? 'live' : 'demo');
-  
   drawTTT(R, sim);
 }
 
@@ -1524,10 +1511,17 @@ function renderStats(R, sim) {
   const tUsd = fmt(R.targetUsd, 2);
   const exitTxt = (R.fut ? `${(sim.pLiq * 100).toFixed(1)}% / ` : '') + `${(sim.pSL * 100).toFixed(1)}% / ${(sim.pTP * 100).toFixed(1)}%`;
   const cell = (k, v, cls = '') => `<div><div class="k">${k}</div><div class="v ${cls}">${v}</div></div>`;
+  
+  let etaTxt = 'Tidak Cukup Volatilitas';
+  if (sim.ttt && sim.ttt.eta) {
+    etaTxt = '~ ' + fmtDur(sim.ttt.eta.minutes);
+  }
+
   $('simStats').innerHTML =
     cell(`P(≥ ${tUsd})`, (sim.pTarget * 100).toFixed(1) + '%', sim.pTarget >= 0.55 ? 'up' : '') +
     cell('Median PnL', pctTxt(sim.median), pctCls(sim.median)) +
-    cell(R.fut ? 'P(liq)/P(SL)/P(TP)' : 'P(SL)/P(TP)', exitTxt, (sim.pLiq + sim.pSL) > 0.2 ? 'dn' : '');
+    cell(R.fut ? 'P(liq)/P(SL)/P(TP)' : 'P(SL)/P(TP)', exitTxt, (sim.pLiq + sim.pSL) > 0.2 ? 'dn' : '') +
+    cell('Estimasi Waktu', etaTxt);
 }
 
 function renderMcSummary(R, sim) {
