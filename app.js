@@ -152,7 +152,7 @@ function fitGARCH(r) {
   let m = 0; for (const x of r) m += x; m /= T;
   const e = new Float64Array(T); let v = 0;
   for (let t = 0; t < T; t++) { e[t] = r[t] - m; v += e[t] * e[t]; } 
-  v /= T; // FIXED: Harus di luar loop
+  v /= T;
   
   if (!(v > 0)) return null;
   let best = null;
@@ -455,7 +455,7 @@ class GridBook {
   reset(p) {
     const R = this.R;
     this.L.length = 0; this.Sh.length = 0; this.sIL = 0; this.sIS = 0; this.realized = 0; this.cycles = 0;
-    const lvl = Math.min(R.grids, Math.max(0, Math.floor((p - R.low) / R.step))); // FIXED: Typo tanda ')' berlebih dihapus
+    const lvl = Math.min(R.grids, Math.max(0, Math.floor((p - R.low) / R.step))); 
     this.nb = lvl; this.ns = lvl + 1;
     if (this.mode === 0) { for (let k = 0; k < R.grids - lvl; k++) this.openL(p); }
     else if (this.mode === 1) { for (let k = 0; k < lvl; k++) this.openS(p); }
@@ -1494,15 +1494,29 @@ function renderOptimizer(opt, cfg) {
 
 function renderTTT(R, sim) {
   const T = sim.ttt;
+  
   let tbl = '<div style="overflow-x:auto"><table class="rpt"><tr><th>Dalam ≤</th>';
   T.buckets.forEach((b) => { tbl += `<th>${fmtDur(b.t)}</th>`; });
   tbl += '</tr><tr><td>P(tercapai)</td>';
   T.buckets.forEach((b) => { tbl += `<td class="${b.p >= 0.5 ? 'up' : ''}">${(b.p * 100).toFixed(1)}%</td>`; });
   tbl += '</tr></table></div>';
 
-  $('tttBody').innerHTML = `<div class="bd" style="padding-top:0">${tbl}</div>`;
+  let etaHtml = '';
+  if (T.eta) {
+    etaHtml = `<div style="margin-top:12px; font-size:13px; padding-top:8px; border-top:1px solid var(--border);">
+      Estimasi Waktu (Analitik): <b>~${fmtDur(T.eta.minutes)}</b> 
+      <span class="mut" style="font-size:11px;">(Butuh ≈ ${T.eta.cycles} siklus matching grid)</span>
+    </div>`;
+  } else {
+    etaHtml = `<div style="margin-top:12px; font-size:13px; padding-top:8px; border-top:1px solid var(--border); color:var(--red);">
+      Estimasi Waktu: Tidak dapat dikalkulasi (Profit per grid terlalu kecil atau volatilitas nol).
+    </div>`;
+  }
+
+  $('tttBody').innerHTML = `<div class="bd" style="padding-top:0">${tbl}${etaHtml}</div>`;
   $('tttBadge').textContent = T.t50 != null ? `50% ≤ ${fmtDur(T.t50)}` : `P ${(sim.pTouch * 100).toFixed(0)}%`;
   $('tttBadge').className = 'badge ' + (T.t50 != null ? 'live' : 'demo');
+  
   drawTTT(R, sim);
 }
 
