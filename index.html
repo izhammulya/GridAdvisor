@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Gridfish v8 · Penasihat grid bot Pionex</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Instrument+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🐟</text></svg>">
+</head>
+<body>
+
+<header class="top">
+  <div class="brand">
+    <svg class="mark" viewBox="0 0 40 24" aria-hidden="true">
+      <path d="M2 12c6-9 18-11 27-2l7-5v14l-7-5C20 23 8 21 2 12z" fill="none" stroke="currentColor" stroke-width="2"/>
+      <path d="M9 6v12M15 4v16M21 5v14" stroke="currentColor" stroke-width="1.2" opacity=".55"/>
+      <circle cx="9" cy="10.5" r="1.4" fill="currentColor"/>
+    </svg>
+    <span class="word">gridfish</span><span class="ver">v8</span>
+  </div>
+  <div class="ticker" id="ticker" aria-live="polite">Belum ada data — pilih koin lalu jalankan analisa.</div>
+  <div class="clock" id="clock"></div>
+</header>
+
+<main class="layout">
+  <!-- ================= SETUP ================= -->
+  <aside class="setup" aria-label="Setup bot">
+    <h2 class="h-side">Setup bot</h2>
+
+    <div class="fld">
+      <span class="lbl" id="lblCoin">Koin</span>
+      <div class="seg" id="segCoin" role="radiogroup" aria-labelledby="lblCoin">
+        <button type="button" data-v="LINK" class="on">LINK</button>
+        <button type="button" data-v="SOL">SOL</button>
+        <button type="button" data-v="ETH">ETH</button>
+        <button type="button" data-v="INJ">INJ</button>
+      </div>
+    </div>
+
+    <div class="fld">
+      <span class="lbl" id="lblProd">Produk</span>
+      <div class="seg" id="segProd" role="radiogroup" aria-labelledby="lblProd">
+        <button type="button" data-v="spot" class="on">Grid spot</button>
+        <button type="button" data-v="fut">Futures grid</button>
+      </div>
+    </div>
+
+    <div class="fld fut-only hide" id="fldDir">
+      <span class="lbl" id="lblDir">Arah</span>
+      <div class="seg" id="segDir" role="radiogroup" aria-labelledby="lblDir">
+        <button type="button" data-v="long" class="on long">Long</button>
+        <button type="button" data-v="short">Short</button>
+        <button type="button" data-v="neutral">Neutral</button>
+      </div>
+    </div>
+
+    <div class="row2">
+      <label class="fld"><span class="lbl">Investasi (USDT)</span><input type="number" id="inInvest" value="50" min="10" step="1"></label>
+      <label class="fld fut-only hide" id="fldLev"><span class="lbl">Leverage</span><input type="number" id="inLev" value="3" min="1" max="10" step="1"></label>
+    </div>
+    <div class="row2">
+      <label class="fld"><span class="lbl">Horizon (hari)</span><input type="number" id="inDays" value="7" min="1" max="30" step="1"></label>
+      <label class="fld"><span class="lbl">Fee per sisi (%)</span><input type="number" id="inFee" value="0.05" min="0" max="0.2" step="0.01"></label>
+    </div>
+    <label class="fld"><span class="lbl">Target profit (USDT)</span><input type="number" id="inTarget" min="0" step="any" placeholder="otomatis"></label>
+
+    <label class="switch">
+      <input type="checkbox" id="inExit" checked>
+      <span class="knob" aria-hidden="true"></span>
+      <span>Tutup bot begitu target tercapai <small>seperti kebiasaan di jurnal Anda</small></span>
+    </label>
+
+    <details class="adv">
+      <summary>Pengaturan lanjutan</summary>
+      <div class="fld">
+        <span class="lbl" id="lblModel">Model simulasi</span>
+        <div class="seg" id="segModel" role="radiogroup" aria-labelledby="lblModel">
+          <button type="button" data-v="hmm" class="on">HMM regime</button>
+          <button type="button" data-v="gbm">GBM klasik</button>
+        </div>
+      </div>
+      <div class="row2">
+        <label class="fld"><span class="lbl">Lebar range ×</span><input type="number" id="inWidth" value="1.00" min="0.5" max="2.5" step="0.05"></label>
+        <label class="fld"><span class="lbl">Seed</span><input type="text" id="inSeed" placeholder="acak"></label>
+      </div>
+      <label class="fld fut-only hide" id="fldFund"><span class="lbl">Funding per 8 jam (%) — positif: long bayar</span><input type="number" id="inFunding" value="0.01" step="0.005"></label>
+    </details>
+
+    <button class="btn-primary" id="btnGo" type="button">Analisa setup</button>
+    <p class="hint" id="goHint">Target otomatis: spot 0,30% investasi · futures 1 USDT per 100 USDT margin.</p>
+  </aside>
+
+  <!-- ================= HASIL ================= -->
+  <section class="results">
+    <div class="hero" id="hero">
+      <div class="hero-empty">
+        <p class="hero-q">Buka bot sekarang atau tunggu — dan kira-kira kapan targetnya kena?</p>
+        <p class="hero-sub">Gridfish menarik harga &amp; candle langsung dari Pionex, menjalankan 5.000 simulasi jalur harga, lalu memperkirakan jam tutupnya dari jurnal trade nyata Anda di Google Sheet.</p>
+      </div>
+    </div>
+
+    <nav class="tabs" role="tablist" aria-label="Detail hasil">
+      <button role="tab" data-tab="decision" aria-selected="true">Keputusan</button>
+      <button role="tab" data-tab="setting" aria-selected="false">Setting Pionex</button>
+      <button role="tab" data-tab="time" aria-selected="false">Waktu target</button>
+      <button role="tab" data-tab="mc" aria-selected="false">Monte Carlo</button>
+      <button role="tab" data-tab="market" aria-selected="false">Pasar &amp; regime</button>
+      <button role="tab" data-tab="repair" aria-selected="false">Repair bot</button>
+      <button role="tab" data-tab="journal" aria-selected="false">Jurnal</button>
+    </nav>
+
+    <div class="panel" id="tab-decision" role="tabpanel">
+      <div id="decBody"><p class="empty">Hasil keputusan muncul setelah analisa dijalankan.</p></div>
+      <div id="decAlt"></div>
+    </div>
+
+    <div class="panel hide" id="tab-setting" role="tabpanel">
+      <div id="recoBody"><p class="empty">Angka yang tinggal disalin ke form Pionex muncul di sini.</p></div>
+    </div>
+
+    <div class="panel hide" id="tab-time" role="tabpanel">
+      <div id="tttBody"><p class="empty">Peluang target tercapai dalam 5 menit, 15 menit, 1 jam, dst. muncul di sini.</p></div>
+      <div class="chart"><canvas id="cvTTT"></canvas></div>
+      <div id="tttNote"></div>
+    </div>
+
+    <div class="panel hide" id="tab-mc" role="tabpanel">
+      <div id="mcHead"><p class="empty">Jalankan analisa untuk melihat 5.000 kemungkinan jalur harga.</p></div>
+      <figure class="fig">
+        <figcaption>Kepadatan jalur harga. Makin pekat, makin sering harga berada di situ. Garis tipis hijau = garis grid.</figcaption>
+        <div class="chart"><canvas id="cvCone"></canvas></div>
+      </figure>
+      <figure class="fig">
+        <figcaption>Perjalanan profit (% modal): pita 50% dan 90% skenario, garis tebal = median.</figcaption>
+        <div class="chart"><canvas id="cvEquity"></canvas></div>
+      </figure>
+      <figure class="fig">
+        <figcaption>Hasil akhir tiap jalur, diwarnai menurut cara bot berakhir.</figcaption>
+        <div class="chart"><canvas id="cvOutcome"></canvas></div>
+        <div class="legend" id="outLegend"></div>
+      </figure>
+      <div id="mcSummary"></div>
+    </div>
+
+    <div class="panel hide" id="tab-market" role="tabpanel">
+      <div id="mktBody"><p class="empty">Data pasar, trend, dan regime muncul setelah analisa.</p></div>
+      <div class="chart"><canvas id="cvSpark"></canvas></div>
+      <div id="mktNotes"></div>
+    </div>
+
+    <div class="panel hide" id="tab-repair" role="tabpanel">
+      <p class="lead">Bot futures yang sedang rugi: tambah dana, tahan, atau tutup? Salin angka dari tab <i>Details</i> bot di Pionex. Koin mengikuti pilihan di setup.</p>
+      <div class="fld">
+        <span class="lbl" id="lblRp">Arah bot</span>
+        <div class="seg seg-sm" id="segRpDir" role="radiogroup" aria-labelledby="lblRp">
+          <button type="button" data-v="short" class="on short">Short</button>
+          <button type="button" data-v="long">Long</button>
+        </div>
+      </div>
+      <div class="rp-grid">
+        <label class="fld"><span class="lbl">Posisi (koin)</span><input type="number" id="rpQty" value="234" step="any"></label>
+        <label class="fld"><span class="lbl">Avg hold price</span><input type="number" id="rpAvg" value="5.245" step="any"></label>
+        <label class="fld"><span class="lbl">Harga sekarang</span><input type="number" id="rpPrice" step="any" placeholder="dari Pionex"></label>
+        <label class="fld"><span class="lbl">Range bawah</span><input type="number" id="rpLow" value="4.90" step="any"></label>
+        <label class="fld"><span class="lbl">Range atas</span><input type="number" id="rpHigh" value="5.75" step="any"></label>
+        <label class="fld"><span class="lbl">Jumlah grid</span><input type="number" id="rpGrids" value="85" step="1"></label>
+        <label class="fld"><span class="lbl">Qty per grid</span><input type="number" id="rpQtyGrid" value="3.6" step="any"></label>
+        <label class="fld"><span class="lbl">Fee per sisi (%)</span><input type="number" id="rpFee" value="0.05" step="0.01"></label>
+        <label class="fld"><span class="lbl">Liq price</span><input type="number" id="rpLiq" value="6.16" step="any"></label>
+        <label class="fld"><span class="lbl">Total profit</span><input type="number" id="rpPnl" value="-55.83" step="any"></label>
+        <label class="fld"><span class="lbl">Grid profit</span><input type="number" id="rpGridProfit" value="11.86" step="any"></label>
+        <label class="fld"><span class="lbl">Investasi</span><input type="number" id="rpInvest" value="335.59" step="any"></label>
+        <label class="fld"><span class="lbl">Saldo tersedia</span><input type="number" id="rpAvail" value="278.11" step="any"></label>
+        <label class="fld"><span class="lbl">Target exit (USDT)</span><input type="number" id="rpTarget" min="1" step="any" placeholder="otomatis 1%"></label>
+        <label class="fld"><span class="lbl">Horizon (hari)</span><input type="number" id="rpDays" value="30" min="3" max="60" step="1"></label>
+        <label class="fld"><span class="lbl">Funding / 8 jam (%)</span><input type="number" id="rpFund" value="0.01" step="0.005"></label>
+      </div>
+      <button class="btn-primary btn-ochre" id="btnRepair" type="button">Analisa repair</button>
+      <div id="repairBody"></div>
+    </div>
+
+    <div class="panel hide" id="tab-journal" role="tabpanel">
+      <div class="jactions">
+        <button class="btn" type="button" id="btnJSync">Sinkron sekarang</button>
+        <button class="btn btn-quiet" type="button" id="btnJImport">Tempel manual</button>
+        <span class="small" id="jSync" aria-live="polite"></span>
+      </div>
+      <div class="jimport hide" id="jImportBox">
+        <label class="fld"><span class="lbl">Cadangan bila sheet tidak terjangkau: salin tabel "Evaluasi agent" beserta header lalu tempel di sini. Data jurnal tersimpan diganti.</span>
+          <textarea id="jImportText" rows="6" spellcheck="false"></textarea></label>
+        <button class="btn-primary" type="button" id="btnJImportApply">Pakai data ini</button>
+      </div>
+      <div id="jStats"></div>
+      <div id="jTable"></div>
+    </div>
+  </section>
+</main>
+
+<footer class="disc">
+  Bukan nasihat keuangan. Keputusan GO / HOLD / NO-GO adalah aturan berbasis model probabilistik, bukan prediksi pasti. Futures dengan leverage bisa terlikuidasi hingga seluruh margin hilang; menambah dana ke bot yang rugi memperbesar eksposur. Periksa setiap angka sebelum menekan tombol di Pionex.
+</footer>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
